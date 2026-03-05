@@ -1,0 +1,16 @@
+[project]
+name = "Helix"
+version = "0.1.0"
+description = "Mamba Hybrid: A versatile audio processing library for efficient and high-quality audio understanding."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.4.2",
+    "pandas>=3.0.1",
+    "soundfile>=0.13.1",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+    "torchcodec>=0.10.0",
+    "matplotlib>=3.7.1",
+    "mamba-ssm>=1.0.0"
+]
