@@ -5,6 +5,7 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import Dataset, DataLoader
+import soundfile as sf
 
 
 class ESC50Raw(Dataset):
@@ -24,21 +25,11 @@ class ESC50Raw(Dataset):
         return len(self.data)
 
     def _load_and_resample(self, path):
-        waveform, sr = torchaudio.load(path)
-
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)  # shape: (channels, time)
         if sr != self.target_sr:
-            resampler = T.Resample(sr, self.target_sr)
+            resampler = T.Resample(orig_freq=sr, new_freq=self.target_sr)
             waveform = resampler(waveform)
-
-        if waveform.shape[1] < self.target_length:
-            pad = self.target_length - waveform.shape[1]
-            waveform = torch.nn.functional.pad(waveform, (0, pad))
-        else:
-            waveform = waveform[:, :self.target_length]
-
         return waveform
 
     def _augment(self, waveform):

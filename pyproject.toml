@@ -10,7 +10,6 @@ dependencies = [
     "soundfile>=0.13.1",
     "torch>=2.10.0",
     "torchaudio>=2.10.0",
-    "torchcodec>=0.10.0",
     "matplotlib>=3.7.1",
     "mamba-ssm>=1.0.0"
 ]
