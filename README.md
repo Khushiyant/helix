@@ -31,3 +31,17 @@ python train.py --mode both --data_root data/ESC-50-master
 ```bash
 python main.py
 ```
+
+
+## If you having problem in setting up Mamba
+```bash
+#!/bin/bash
+sudo apt-get update
+sudo apt-get install -y cuda-toolkit-12-4
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+export CUDAHOSTCXX=/usr/bin/g++-11
+export CC=/usr/bin/gcc-11
+export CXX=/usr/bin/g++-11
+pip install mamba-ssm soundfile
+```
