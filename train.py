@@ -94,17 +94,22 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
     print(f"  FOLD {fold}/5 — Mode: {mode}")
     print(f"{'='*60}")
 
+    data_mode = mode.replace("helix-", "") if mode.startswith("helix-") else mode
     train_loader, test_loader = get_dataloaders(
         root=data_root,
         test_fold=fold,
         batch_size=batch_size,
-        mode=mode,
+        mode=data_mode,
     )
 
-    if mode == "raw":
-        model = RawWaveformMamba(num_classes=50).to(device)
+    helix = mode.startswith("helix-")
+    base_mode = mode.replace("helix-", "") if helix else mode
+    attention_at = (3,) if helix else ()
+
+    if base_mode == "raw":
+        model = RawWaveformMamba(num_classes=50, attention_at=attention_at).to(device)
     else:
-        model = SpectrogramMamba(num_classes=50).to(device)
+        model = SpectrogramMamba(num_classes=50, attention_at=attention_at).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {param_count:,}")
@@ -211,7 +216,7 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
 def main():
     parser = argparse.ArgumentParser(description="AURORA Validation Experiment")
     parser.add_argument("--mode", type=str, default="raw",
-                        choices=["raw", "spectrogram", "both"])
+                        choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "both"])
     parser.add_argument("--data_root", type=str, default="data/ESC-50-master")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)

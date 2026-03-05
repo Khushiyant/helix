@@ -3,6 +3,20 @@ import torch.nn as nn
 from mamba_ssm import Mamba
 
 
+class SelfAttentionBlock(nn.Module):
+
+    def __init__(self, d_model=256, num_heads=4):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+
+    def forward(self, x):
+        residual = x
+        h = self.norm(x)
+        out, _ = self.attn(h, h, h)
+        return out + residual
+
+
 class BiMambaBlock(nn.Module):
 
     def __init__(self, d_model=256, d_state=32, d_conv=4, expand=2):
@@ -47,6 +61,8 @@ class RawWaveformMamba(nn.Module):
         n_layers=6,
         patch_size=160,
         patch_stride=160,
+        attention_at=(),
+        num_heads=4,
     ):
         super().__init__()
 
@@ -58,15 +74,14 @@ class RawWaveformMamba(nn.Module):
         )
         self.input_norm = nn.LayerNorm(d_model)
 
-        self.layers = nn.ModuleList([
-            BiMambaBlock(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            if i in attention_at:
+                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads))
+            else:
+                self.layers.append(BiMambaBlock(
+                    d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
+                ))
 
         self.final_norm = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
@@ -98,6 +113,8 @@ class SpectrogramMamba(nn.Module):
         n_mels=128,
         patch_h=16,
         patch_w=16,
+        attention_at=(),
+        num_heads=4,
     ):
         super().__init__()
 
@@ -109,15 +126,14 @@ class SpectrogramMamba(nn.Module):
         )
         self.input_norm = nn.LayerNorm(d_model)
 
-        self.layers = nn.ModuleList([
-            BiMambaBlock(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            if i in attention_at:
+                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads))
+            else:
+                self.layers.append(BiMambaBlock(
+                    d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
+                ))
 
         self.final_norm = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
@@ -138,30 +154,24 @@ class SpectrogramMamba(nn.Module):
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Testing Raw Waveform Model")
-    print("=" * 60)
-    model_raw = RawWaveformMamba(num_classes=50)
-    total_params = sum(p.numel() for p in model_raw.parameters())
-    print(f"Total parameters: {total_params:,}")
+    configs = [
+        ("Raw Waveform (Pure Mamba)", lambda: RawWaveformMamba(num_classes=50), torch.randn(2, 1, 80000)),
+        ("Raw Waveform (HELIX)", lambda: RawWaveformMamba(num_classes=50, attention_at=(3,)), torch.randn(2, 1, 80000)),
+        ("Spectrogram (Pure Mamba)", lambda: SpectrogramMamba(num_classes=50), torch.randn(2, 1, 128, 157)),
+        ("Spectrogram (HELIX)", lambda: SpectrogramMamba(num_classes=50, attention_at=(3,)), torch.randn(2, 1, 128, 157)),
+    ]
 
-    dummy_wav = torch.randn(2, 1, 80000)
-    out = model_raw(dummy_wav)
-    print(f"Input shape:  {dummy_wav.shape}")
-    print(f"Output shape: {out.shape}")
+    for name, make_model, dummy in configs:
+        print("=" * 60)
+        print(f"Testing {name}")
+        print("=" * 60)
+        model = make_model()
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Parameters: {total_params:,}")
+        out = model(dummy)
+        print(f"  Input:  {dummy.shape}")
+        print(f"  Output: {out.shape}")
+        print(f"  Layers: {[type(l).__name__ for l in model.layers]}")
+        print()
 
-    print()
-    print("=" * 60)
-    print("Testing Spectrogram Model")
-    print("=" * 60)
-    model_spec = SpectrogramMamba(num_classes=50)
-    total_params = sum(p.numel() for p in model_spec.parameters())
-    print(f"Total parameters: {total_params:,}")
-
-    dummy_spec = torch.randn(2, 1, 128, 157)
-    out = model_spec(dummy_spec)
-    print(f"Input shape:  {dummy_spec.shape}")
-    print(f"Output shape: {out.shape}")
-
-    print()
-    print("Both models working correctly!")
+    print("All models working correctly!")
