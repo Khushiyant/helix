@@ -9,6 +9,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model import RawWaveformMamba, SpectrogramMamba
+
+N_LAYERS = 6
 from dataset import get_dataloaders
 
 
@@ -94,7 +96,7 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
     print(f"  FOLD {fold}/5 — Mode: {mode}")
     print(f"{'='*60}")
 
-    data_mode = mode.replace("helix-", "") if mode.startswith("helix-") else mode
+    data_mode = mode.replace("helix-", "").replace("attention-", "")
     train_loader, test_loader = get_dataloaders(
         root=data_root,
         test_fold=fold,
@@ -102,14 +104,21 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
         mode=data_mode,
     )
 
+    pure_attention = mode.startswith("attention-")
     helix = mode.startswith("helix-")
-    base_mode = mode.replace("helix-", "") if helix else mode
-    attention_at = (3,) if helix else ()
+    base_mode = mode.replace("helix-", "").replace("attention-", "")
+
+    if pure_attention:
+        attention_at = tuple(range(N_LAYERS))
+    elif helix:
+        attention_at = (3,)
+    else:
+        attention_at = ()
 
     if base_mode == "raw":
-        model = RawWaveformMamba(num_classes=50, attention_at=attention_at).to(device)
+        model = RawWaveformMamba(num_classes=50, n_layers=N_LAYERS, attention_at=attention_at).to(device)
     else:
-        model = SpectrogramMamba(num_classes=50, attention_at=attention_at).to(device)
+        model = SpectrogramMamba(num_classes=50, n_layers=N_LAYERS, attention_at=attention_at).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {param_count:,}")
@@ -216,7 +225,7 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
 def main():
     parser = argparse.ArgumentParser(description="AURORA Validation Experiment")
     parser.add_argument("--mode", type=str, default="raw",
-                        choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "both"])
+                        choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
     parser.add_argument("--data_root", type=str, default="data/ESC-50-master")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -241,27 +250,22 @@ def main():
 
     results = {}
 
-    if args.mode in ["raw", "both"]:
-        mean, std = run_experiment(
-            mode="raw",
-            data_root=args.data_root,
-            device=device,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-        )
-        results["raw"] = {"mean": mean, "std": std}
+    modes_to_run = []
+    if args.mode == "both":
+        modes_to_run = ["raw", "spectrogram"]
+    else:
+        modes_to_run = [args.mode]
 
-    if args.mode in ["spectrogram", "both"]:
+    for mode in modes_to_run:
         mean, std = run_experiment(
-            mode="spectrogram",
+            mode=mode,
             data_root=args.data_root,
             device=device,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
         )
-        results["spectrogram"] = {"mean": mean, "std": std}
+        results[mode] = {"mean": mean, "std": std}
 
     if args.mode == "both":
         print(f"\n{'#'*60}")

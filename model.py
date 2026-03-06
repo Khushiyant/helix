@@ -157,6 +157,7 @@ if __name__ == "__main__":
     configs = [
         ("Raw Waveform (Pure Mamba)", lambda: RawWaveformMamba(num_classes=50), torch.randn(2, 1, 80000)),
         ("Raw Waveform (HELIX)", lambda: RawWaveformMamba(num_classes=50, attention_at=(3,)), torch.randn(2, 1, 80000)),
+        ("Raw Waveform (Pure Attention)", lambda: RawWaveformMamba(num_classes=50, attention_at=tuple(range(6))), torch.randn(2, 1, 80000)),
         ("Spectrogram (Pure Mamba)", lambda: SpectrogramMamba(num_classes=50), torch.randn(2, 1, 128, 157)),
         ("Spectrogram (HELIX)", lambda: SpectrogramMamba(num_classes=50, attention_at=(3,)), torch.randn(2, 1, 128, 157)),
     ]
