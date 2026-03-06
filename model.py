@@ -5,15 +5,17 @@ from mamba_ssm import Mamba
 
 class SelfAttentionBlock(nn.Module):
 
-    def __init__(self, d_model=256, num_heads=4, expand=2):
+    def __init__(self, d_model=256, num_heads=4, ffn_dim=None):
         super().__init__()
+        if ffn_dim is None:
+            ffn_dim = d_model * 4
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * expand),
+            nn.Linear(d_model, ffn_dim),
             nn.GELU(),
-            nn.Linear(d_model * expand, d_model),
+            nn.Linear(ffn_dim, d_model),
         )
 
     def forward(self, x):
@@ -81,10 +83,16 @@ class RawWaveformMamba(nn.Module):
         )
         self.input_norm = nn.LayerNorm(d_model)
 
+        # Match attention block params to BiMamba block params
+        ref = BiMambaBlock(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        mamba_params = sum(p.numel() for p in ref.parameters())
+        attn_fixed = 4 * d_model**2 + 4 * d_model + 4 * d_model  # MHA + 2 norms
+        ffn_dim = (mamba_params - attn_fixed - d_model) // (2 * d_model + 1)
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             if i in attention_at:
-                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads))
+                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads, ffn_dim=ffn_dim))
             else:
                 self.layers.append(BiMambaBlock(
                     d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
@@ -133,10 +141,15 @@ class SpectrogramMamba(nn.Module):
         )
         self.input_norm = nn.LayerNorm(d_model)
 
+        ref = BiMambaBlock(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        mamba_params = sum(p.numel() for p in ref.parameters())
+        attn_fixed = 4 * d_model**2 + 4 * d_model + 4 * d_model
+        ffn_dim = (mamba_params - attn_fixed - d_model) // (2 * d_model + 1)
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             if i in attention_at:
-                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads))
+                self.layers.append(SelfAttentionBlock(d_model=d_model, num_heads=num_heads, ffn_dim=ffn_dim))
             else:
                 self.layers.append(BiMambaBlock(
                     d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
