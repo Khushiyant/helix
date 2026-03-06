@@ -5,16 +5,23 @@ from mamba_ssm import Mamba
 
 class SelfAttentionBlock(nn.Module):
 
-    def __init__(self, d_model=256, num_heads=4):
+    def __init__(self, d_model=256, num_heads=4, expand=2):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * expand),
+            nn.GELU(),
+            nn.Linear(d_model * expand, d_model),
+        )
 
     def forward(self, x):
-        residual = x
-        h = self.norm(x)
+        h = self.norm1(x)
         out, _ = self.attn(h, h, h)
-        return out + residual
+        x = x + out
+        x = x + self.ffn(self.norm2(x))
+        return x
 
 
 class BiMambaBlock(nn.Module):
