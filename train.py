@@ -8,8 +8,10 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from datetime import datetime
+
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders
 
 N_LAYERS = 6
 
@@ -35,26 +37,26 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True):
+def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True, n_pool_tokens=None):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
 
-    for batch_idx, (inputs, targets) in enumerate(loader):
+    for inputs, targets in loader:
         inputs = inputs.to(device)
         targets = targets.to(device)
 
         if use_mixup:
             inputs, targets_a, targets_b, lam = mixup(inputs, targets, alpha=0.3)
-            outputs = model(inputs)
+            outputs = model(inputs, n_pool_tokens=n_pool_tokens)
             loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
 
             _, predicted = outputs.max(1)
             correct += (lam * predicted.eq(targets_a).sum().item()
                         + (1 - lam) * predicted.eq(targets_b).sum().item())
         else:
-            outputs = model(inputs)
+            outputs = model(inputs, n_pool_tokens=n_pool_tokens)
             loss = criterion(outputs, targets)
             _, predicted = outputs.max(1)
             correct += predicted.eq(targets).sum().item()
@@ -73,7 +75,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True)
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, n_pool_tokens=None):
     model.eval()
     total_loss = 0
     correct = 0
@@ -83,7 +85,7 @@ def evaluate(model, loader, criterion, device):
         inputs = inputs.to(device)
         targets = targets.to(device)
 
-        outputs = model(inputs)
+        outputs = model(inputs, n_pool_tokens=n_pool_tokens)
         loss = criterion(outputs, targets)
 
         _, predicted = outputs.max(1)
@@ -96,23 +98,29 @@ def evaluate(model, loader, criterion, device):
     return avg_loss, accuracy
 
 
-def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4):
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
     num_classes = cfg["num_classes"]
 
     print(f"\n{'='*60}")
-    print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}")
+    print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}" +
+          (f" — n_clips: {n_clips}" if n_clips > 1 else ""))
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
-    loader_fn = get_speechcommands_dataloaders if dataset == "speechcommands" else get_dataloaders
-    train_loader, test_loader = loader_fn(
-        root=data_root,
-        test_fold=fold,
-        batch_size=batch_size,
-        mode=data_mode,
-    )
+    if dataset == "speechcommands" and n_clips > 1:
+        train_loader, test_loader = get_concat_speechcommands_dataloaders(
+            root=data_root, n_clips=n_clips, batch_size=batch_size,
+        )
+    elif dataset == "speechcommands":
+        train_loader, test_loader = get_speechcommands_dataloaders(
+            root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
+        )
+    else:
+        train_loader, test_loader = get_dataloaders(
+            root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
+        )
 
     pure_attention = mode.startswith("attention-")
     helix = mode.startswith("helix-")
@@ -144,9 +152,11 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device
+            model, train_loader, optimizer, criterion, device,
+            n_pool_tokens=n_pool_tokens,
         )
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device,
+                                       n_pool_tokens=n_pool_tokens)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -181,12 +191,14 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
 
     print(f"\n{'#'*60}")
     print(f"  EXPERIMENT: {mode.upper()} — Dataset: {dataset}")
+    if n_clips > 1:
+        print(f"  Long-seq: n_clips={n_clips}, total_audio={n_clips}s, total_tokens={n_clips * 100}")
     print(f"  Device: {device}")
     print(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"{'#'*60}")
@@ -204,6 +216,8 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
+            n_clips=n_clips,
+            n_pool_tokens=n_pool_tokens,
         )
         fold_accuracies.append(best_acc)
         all_histories[f"fold_{fold}"] = history
@@ -221,9 +235,13 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
     print(f"{'='*60}")
 
     os.makedirs("results", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results = {
         "dataset": dataset,
         "mode": mode,
+        "n_clips": n_clips,
+        "total_audio_seconds": n_clips,  # each Speech Commands clip is exactly 1 s
+        "total_tokens": n_clips * 100,
         "fold_accuracies": fold_accuracies,
         "mean_accuracy": mean_acc,
         "std_accuracy": std_acc,
@@ -232,9 +250,14 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
         "lr": lr,
         "histories": all_histories,
     }
-    result_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
-    with open(f"results/{result_prefix}_results.json", "w") as f:
+    if n_clips > 1:
+        result_file = f"results/longseq_n{n_clips}_{mode}_{timestamp}.json"
+    else:
+        result_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
+        result_file = f"results/{result_prefix}_{timestamp}.json"
+    with open(result_file, "w") as f:
         json.dump(results, f, indent=2)
+    print(f"  Results saved to {result_file}")
 
     return mean_acc, std_acc
 
@@ -249,6 +272,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--n_clips", type=int, default=1,
+                        help="Number of clips to concatenate (long-seq experiment)")
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
@@ -270,13 +295,11 @@ def main():
         print("  https://www.kaggle.com/datasets/mmoreaux/environmental-sound-classification-50")
         return
 
+    n_pool_tokens = 100 if args.n_clips > 1 else None
+
     results = {}
 
-    modes_to_run = []
-    if args.mode == "both":
-        modes_to_run = ["raw", "spectrogram"]
-    else:
-        modes_to_run = [args.mode]
+    modes_to_run = ["raw", "spectrogram"] if args.mode == "both" else [args.mode]
 
     for mode in modes_to_run:
         mean, std = run_experiment(
@@ -287,6 +310,8 @@ def main():
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
+            n_clips=args.n_clips,
+            n_pool_tokens=n_pool_tokens,
         )
         results[mode] = {"mean": mean, "std": std}
 

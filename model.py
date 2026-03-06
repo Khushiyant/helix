@@ -101,7 +101,7 @@ class RawWaveformMamba(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, n_pool_tokens=None):
         x = self.patch_embed(x)
         x = x.transpose(1, 2)
         x = self.input_norm(x)
@@ -110,7 +110,7 @@ class RawWaveformMamba(nn.Module):
             x = layer(x)
 
         x = self.final_norm(x)
-        x = x.mean(dim=1)
+        x = x[:, :n_pool_tokens, :].mean(dim=1) if n_pool_tokens is not None else x.mean(dim=1)
         logits = self.classifier(x)
         return logits
 
@@ -158,7 +158,7 @@ class SpectrogramMamba(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, n_pool_tokens=None):
         x = self.patch_embed(x)
         B, C, H, W = x.shape
         x = x.reshape(B, C, H * W).transpose(1, 2)
@@ -168,7 +168,7 @@ class SpectrogramMamba(nn.Module):
             x = layer(x)
 
         x = self.final_norm(x)
-        x = x.mean(dim=1)
+        x = x[:, :n_pool_tokens, :].mean(dim=1) if n_pool_tokens is not None else x.mean(dim=1)
         logits = self.classifier(x)
         return logits
 

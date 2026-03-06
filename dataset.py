@@ -228,6 +228,40 @@ class SpeechCommandsRaw(Dataset):
         return waveform, SPEECH_COMMANDS_LABEL_TO_IDX[label]
 
 
+class ConcatSpeechCommandsRaw(Dataset):
+    """Concatenates N Speech Commands clips along time axis.
+    Label = first clip's class (long-range memory test).
+    """
+
+    def __init__(self, root, subset="training", augment=False, n_clips=10):
+        self.inner = SpeechCommandsRaw(root, subset=subset, augment=False)
+        self.augment = augment
+        self.n_clips = n_clips
+        self.deterministic = subset != "training"
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getitem__(self, idx):
+        waveform, label = self.inner[idx]
+
+        if self.n_clips > 1:
+            parts = [waveform]
+            n = len(self.inner)
+            # Per-idx seed: worker-safe and reproducible for val/test
+            rng = np.random.RandomState(idx) if self.deterministic else np.random
+            for _ in range(self.n_clips - 1):
+                filler_idx = rng.randint(0, n)
+                filler_wav, _ = self.inner[filler_idx]
+                parts.append(filler_wav)
+            waveform = torch.cat(parts, dim=-1)  # (1, n_clips * 16000)
+
+        if self.augment:
+            waveform = self.inner._augment(waveform)
+
+        return waveform, label
+
+
 class SpeechCommandsSpectrogram(Dataset):
 
     def __init__(self, root, subset="training", augment=False):
@@ -308,6 +342,30 @@ def get_speechcommands_dataloaders(root, test_fold=1, batch_size=32, mode="raw")
     print(f"\nCreating Speech Commands {mode} dataloaders")
     train_dataset = DatasetClass(root, subset="training", augment=True)
     test_dataset = DatasetClass(root, subset="testing", augment=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, test_loader
+
+
+def get_concat_speechcommands_dataloaders(root, n_clips=10, batch_size=32):
+    print(f"\nCreating Concat Speech Commands dataloaders (n_clips={n_clips})")
+    train_dataset = ConcatSpeechCommandsRaw(root, subset="training", augment=True, n_clips=n_clips)
+    test_dataset = ConcatSpeechCommandsRaw(root, subset="testing", augment=False, n_clips=n_clips)
 
     train_loader = DataLoader(
         train_dataset,
