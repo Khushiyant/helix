@@ -121,20 +121,78 @@ SPEECH_COMMANDS_LABELS = sorted([
 
 SPEECH_COMMANDS_LABEL_TO_IDX = {label: i for i, label in enumerate(SPEECH_COMMANDS_LABELS)}
 
+_SC_URL = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.02.tar.gz"
+_SC_FOLDER = "SpeechCommands/speech_commands_v0.02"
+
+
+def _download_speech_commands(root):
+    """Download and extract Speech Commands v2 if not already present."""
+    import tarfile
+    import urllib.request
+
+    data_dir = os.path.join(root, _SC_FOLDER)
+    if os.path.isdir(data_dir) and os.listdir(data_dir):
+        return data_dir
+
+    os.makedirs(data_dir, exist_ok=True)
+    tar_path = os.path.join(root, "speech_commands_v0.02.tar.gz")
+
+    if not os.path.exists(tar_path):
+        print(f"  Downloading Speech Commands v2 (~2.3GB)...")
+        urllib.request.urlretrieve(_SC_URL, tar_path)
+
+    print(f"  Extracting to {data_dir}...")
+    with tarfile.open(tar_path, "r:gz") as tar:
+        tar.extractall(data_dir)
+
+    os.remove(tar_path)
+    return data_dir
+
+
+def _load_speech_commands_split(root, subset):
+    """Build file list for a given split (training/validation/testing)."""
+    data_dir = _download_speech_commands(root)
+
+    val_file = os.path.join(data_dir, "validation_list.txt")
+    test_file = os.path.join(data_dir, "testing_list.txt")
+
+    with open(val_file) as f:
+        val_set = set(f.read().strip().splitlines())
+    with open(test_file) as f:
+        test_set = set(f.read().strip().splitlines())
+
+    label_set = set(SPEECH_COMMANDS_LABELS)
+    all_files = []
+    for label in sorted(os.listdir(data_dir)):
+        label_dir = os.path.join(data_dir, label)
+        if not os.path.isdir(label_dir) or label not in label_set:
+            continue
+        for fname in os.listdir(label_dir):
+            if not fname.endswith(".wav"):
+                continue
+            rel_path = f"{label}/{fname}"
+            if subset == "validation" and rel_path in val_set:
+                all_files.append((os.path.join(label_dir, fname), label))
+            elif subset == "testing" and rel_path in test_set:
+                all_files.append((os.path.join(label_dir, fname), label))
+            elif subset == "training" and rel_path not in val_set and rel_path not in test_set:
+                all_files.append((os.path.join(label_dir, fname), label))
+
+    return all_files
+
 
 class SpeechCommandsRaw(Dataset):
 
     def __init__(self, root, subset="training", augment=False):
-        from torchaudio.datasets import SPEECHCOMMANDS
-        self.dataset = SPEECHCOMMANDS(root, download=True, subset=subset)
+        self.files = _load_speech_commands_split(root, subset)
         self.augment = augment
         self.target_sr = 16000
         self.target_length = 16000  # 1 second at 16kHz
 
-        print(f"  Loaded {len(self.dataset)} clips ({subset})")
+        print(f"  Loaded {len(self.files)} clips ({subset})")
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.files)
 
     def _augment(self, waveform):
         shift = np.random.randint(-1600, 1600)
@@ -149,8 +207,12 @@ class SpeechCommandsRaw(Dataset):
         return waveform
 
     def __getitem__(self, idx):
-        waveform, sr, label, *_ = self.dataset[idx]
+        path, label = self.files[idx]
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
 
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         if sr != self.target_sr:
             waveform = T.Resample(sr, self.target_sr)(waveform)
 
@@ -169,8 +231,7 @@ class SpeechCommandsRaw(Dataset):
 class SpeechCommandsSpectrogram(Dataset):
 
     def __init__(self, root, subset="training", augment=False):
-        from torchaudio.datasets import SPEECHCOMMANDS
-        self.dataset = SPEECHCOMMANDS(root, download=True, subset=subset)
+        self.files = _load_speech_commands_split(root, subset)
         self.augment = augment
         self.target_sr = 16000
         self.target_length = 16000
@@ -184,14 +245,18 @@ class SpeechCommandsSpectrogram(Dataset):
         )
         self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
 
-        print(f"  Loaded {len(self.dataset)} clips ({subset})")
+        print(f"  Loaded {len(self.files)} clips ({subset})")
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        waveform, sr, label, *_ = self.dataset[idx]
+        path, label = self.files[idx]
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
 
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         if sr != self.target_sr:
             waveform = T.Resample(sr, self.target_sr)(waveform)
 
