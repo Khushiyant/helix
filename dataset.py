@@ -111,6 +111,103 @@ class ESC50Spectrogram(Dataset):
         return mel, label
 
 
+SPEECH_COMMANDS_LABELS = sorted([
+    'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five',
+    'follow', 'forward', 'four', 'go', 'happy', 'house', 'learn', 'left',
+    'marvin', 'nine', 'no', 'off', 'on', 'one', 'right', 'seven',
+    'sheila', 'six', 'stop', 'three', 'tree', 'two', 'up', 'visual',
+    'wow', 'yes', 'zero',
+])
+
+SPEECH_COMMANDS_LABEL_TO_IDX = {label: i for i, label in enumerate(SPEECH_COMMANDS_LABELS)}
+
+
+class SpeechCommandsRaw(Dataset):
+
+    def __init__(self, root, subset="training", augment=False):
+        from torchaudio.datasets import SPEECHCOMMANDS
+        self.dataset = SPEECHCOMMANDS(root, download=True, subset=subset)
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 16000  # 1 second at 16kHz
+
+        print(f"  Loaded {len(self.dataset)} clips ({subset})")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _augment(self, waveform):
+        shift = np.random.randint(-1600, 1600)
+        waveform = torch.roll(waveform, shift, dims=-1)
+
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+
+        return waveform
+
+    def __getitem__(self, idx):
+        waveform, sr, label, *_ = self.dataset[idx]
+
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, SPEECH_COMMANDS_LABEL_TO_IDX[label]
+
+
+class SpeechCommandsSpectrogram(Dataset):
+
+    def __init__(self, root, subset="training", augment=False):
+        from torchaudio.datasets import SPEECHCOMMANDS
+        self.dataset = SPEECHCOMMANDS(root, download=True, subset=subset)
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 16000
+
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=128,
+            power=2.0,
+        )
+        self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
+
+        print(f"  Loaded {len(self.dataset)} clips ({subset})")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        waveform, sr, label, *_ = self.dataset[idx]
+
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        mel = self.mel_transform(waveform)
+        mel = self.amplitude_to_db(mel)
+        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+
+        return mel, SPEECH_COMMANDS_LABEL_TO_IDX[label]
+
+
 def get_dataloaders(root, test_fold, batch_size=32, mode="raw"):
     all_folds = [1, 2, 3, 4, 5]
     train_folds = [f for f in all_folds if f != test_fold]
@@ -140,21 +237,58 @@ def get_dataloaders(root, test_fold, batch_size=32, mode="raw"):
     return train_loader, test_loader
 
 
+def get_speechcommands_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  # noqa: ARG001
+    DatasetClass = SpeechCommandsRaw if mode == "raw" else SpeechCommandsSpectrogram
+
+    print(f"\nCreating Speech Commands {mode} dataloaders")
+    train_dataset = DatasetClass(root, subset="training", augment=True)
+    test_dataset = DatasetClass(root, subset="testing", augment=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, test_loader
+
+
 if __name__ == "__main__":
     import sys
 
-    root = sys.argv[1] if len(sys.argv) > 1 else "data/ESC-50-master"
+    dataset = sys.argv[1] if len(sys.argv) > 1 else "esc50"
 
-    if not os.path.exists(root):
-        print(f"ESC-50 not found at {root}")
-        print("Download from: https://github.com/karolpiczak/ESC-50")
-        print("Usage: python dataset.py /path/to/ESC-50-master")
-        exit(1)
+    if dataset == "speechcommands":
+        root = sys.argv[2] if len(sys.argv) > 2 else "data"
 
-    train_loader, test_loader = get_dataloaders(root, test_fold=5, mode="raw")
-    batch = next(iter(train_loader))
-    print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
+        train_loader, test_loader = get_speechcommands_dataloaders(root, mode="raw")
+        batch = next(iter(train_loader))
+        print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
 
-    train_loader, test_loader = get_dataloaders(root, test_fold=5, mode="spectrogram")
-    batch = next(iter(train_loader))
-    print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")
+        train_loader, test_loader = get_speechcommands_dataloaders(root, mode="spectrogram")
+        batch = next(iter(train_loader))
+        print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")
+    else:
+        root = sys.argv[2] if len(sys.argv) > 2 else "data/ESC-50-master"
+        if not os.path.exists(root):
+            print(f"ESC-50 not found at {root}")
+            print("Download from: https://github.com/karolpiczak/ESC-50")
+            exit(1)
+
+        train_loader, test_loader = get_dataloaders(root, test_fold=5, mode="raw")
+        batch = next(iter(train_loader))
+        print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
+
+        train_loader, test_loader = get_dataloaders(root, test_fold=5, mode="spectrogram")
+        batch = next(iter(train_loader))
+        print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")

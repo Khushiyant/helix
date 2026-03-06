@@ -9,9 +9,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model import RawWaveformMamba, SpectrogramMamba
+from dataset import get_dataloaders, get_speechcommands_dataloaders
 
 N_LAYERS = 6
-from dataset import get_dataloaders
+
+DATASET_CONFIG = {
+    "esc50": {"num_classes": 50, "num_folds": 5, "default_root": "data/ESC-50-master"},
+    "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
+}
 
 
 def mixup(x, y, alpha=0.3):
@@ -91,13 +96,18 @@ def evaluate(model, loader, criterion, device):
     return avg_loss, accuracy
 
 
-def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4):
+    cfg = DATASET_CONFIG[dataset]
+    num_folds = cfg["num_folds"]
+    num_classes = cfg["num_classes"]
+
     print(f"\n{'='*60}")
-    print(f"  FOLD {fold}/5 — Mode: {mode}")
+    print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}")
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
-    train_loader, test_loader = get_dataloaders(
+    loader_fn = get_speechcommands_dataloaders if dataset == "speechcommands" else get_dataloaders
+    train_loader, test_loader = loader_fn(
         root=data_root,
         test_fold=fold,
         batch_size=batch_size,
@@ -116,9 +126,9 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
         attention_at = ()
 
     if base_mode == "raw":
-        model = RawWaveformMamba(num_classes=50, n_layers=N_LAYERS, attention_at=attention_at).to(device)
+        model = RawWaveformMamba(num_classes=num_classes, n_layers=N_LAYERS, attention_at=attention_at).to(device)
     else:
-        model = SpectrogramMamba(num_classes=50, n_layers=N_LAYERS, attention_at=attention_at).to(device)
+        model = SpectrogramMamba(num_classes=num_classes, n_layers=N_LAYERS, attention_at=attention_at).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {param_count:,}")
@@ -144,9 +154,10 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
         if test_acc > best_acc:
             best_acc = test_acc
             os.makedirs("checkpoints", exist_ok=True)
+            ckpt_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
             torch.save(
                 model.state_dict(),
-                f"checkpoints/{mode}_fold{fold}_best.pt"
+                f"checkpoints/{ckpt_prefix}_fold{fold}_best.pt"
             )
 
         history.append({
@@ -170,9 +181,12 @@ def train_fold(fold, mode, data_root, device, epochs=100, batch_size=32, lr=3e-4
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4):
+    cfg = DATASET_CONFIG[dataset]
+    num_folds = cfg["num_folds"]
+
     print(f"\n{'#'*60}")
-    print(f"  EXPERIMENT: {mode.upper()}")
+    print(f"  EXPERIMENT: {mode.upper()} — Dataset: {dataset}")
     print(f"  Device: {device}")
     print(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"{'#'*60}")
@@ -180,12 +194,13 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
     fold_accuracies = []
     all_histories = {}
 
-    for fold in range(1, 6):
+    for fold in range(1, num_folds + 1):
         best_acc, history = train_fold(
             fold=fold,
             mode=mode,
             data_root=data_root,
             device=device,
+            dataset=dataset,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -197,7 +212,7 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
     std_acc = np.std(fold_accuracies)
 
     print(f"\n{'='*60}")
-    print(f"  {mode.upper()} RESULTS — 5-Fold Cross Validation")
+    print(f"  {mode.upper()} RESULTS — {num_folds}-Fold Cross Validation")
     print(f"{'='*60}")
     for i, acc in enumerate(fold_accuracies, 1):
         print(f"  Fold {i}: {acc:.1f}%")
@@ -207,6 +222,7 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
 
     os.makedirs("results", exist_ok=True)
     results = {
+        "dataset": dataset,
         "mode": mode,
         "fold_accuracies": fold_accuracies,
         "mean_accuracy": mean_acc,
@@ -216,22 +232,28 @@ def run_experiment(mode, data_root, device, epochs=100, batch_size=32, lr=3e-4):
         "lr": lr,
         "histories": all_histories,
     }
-    with open(f"results/{mode}_results.json", "w") as f:
+    result_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
+    with open(f"results/{result_prefix}_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
     return mean_acc, std_acc
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AURORA Validation Experiment")
+    parser = argparse.ArgumentParser(description="Helix Validation Experiment")
     parser.add_argument("--mode", type=str, default="raw",
                         choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
-    parser.add_argument("--data_root", type=str, default="data/ESC-50-master")
+    parser.add_argument("--dataset", type=str, default="esc50",
+                        choices=["esc50", "speechcommands"])
+    parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
+
+    if args.data_root is None:
+        args.data_root = DATASET_CONFIG[args.dataset]["default_root"]
 
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}")
@@ -240,8 +262,8 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if not os.path.exists(args.data_root):
-        print(f"\nERROR: ESC-50 not found at '{args.data_root}'")
+    if args.dataset != "speechcommands" and not os.path.exists(args.data_root):
+        print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         print("\nTo download:")
         print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")
         print("\nOr download from Kaggle:")
@@ -261,6 +283,7 @@ def main():
             mode=mode,
             data_root=args.data_root,
             device=device,
+            dataset=args.dataset,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
@@ -269,7 +292,7 @@ def main():
 
     if args.mode == "both":
         print(f"\n{'#'*60}")
-        print(f"  COMPARISON: RAW WAVEFORM vs SPECTROGRAM")
+        print(f"  COMPARISON: RAW WAVEFORM vs SPECTROGRAM ({args.dataset})")
         print(f"{'#'*60}")
         print(f"  Raw waveform:  {results['raw']['mean']:.1f}% ± {results['raw']['std']:.1f}%")
         print(f"  Spectrogram:   {results['spectrogram']['mean']:.1f}% ± {results['spectrogram']['std']:.1f}%")
