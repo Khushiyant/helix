@@ -11,3 +11,4 @@ wheels/
 
 *.ipynb
 uv.lock
+.env

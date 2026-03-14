@@ -83,7 +83,8 @@ class ESC50Spectrogram(Dataset):
         return len(self.data)
 
     def _load_and_resample(self, path):
-        waveform, sr = torchaudio.load(path)
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
         if sr != self.target_sr:
