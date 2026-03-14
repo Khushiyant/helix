@@ -10,6 +10,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from datetime import datetime
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from model import RawWaveformMamba, SpectrogramMamba
 from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders
 
@@ -98,7 +103,7 @@ def evaluate(model, loader, criterion, device, n_pool_tokens=None):
     return avg_loss, accuracy
 
 
-def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None):
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
     num_classes = cfg["num_classes"]
@@ -141,6 +146,9 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {param_count:,}")
 
+    if use_wandb:
+        wandb.watch(model, log="gradients", log_freq=50)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -178,6 +186,21 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
             "test_acc": test_acc,
         })
 
+        if use_wandb:
+            try:
+                wandb.log({
+                    f"fold_{fold}/train_loss": train_loss,
+                    f"fold_{fold}/train_acc": train_acc,
+                    f"fold_{fold}/test_loss": test_loss,
+                    f"fold_{fold}/test_acc": test_acc,
+                    f"fold_{fold}/best_acc": best_acc,
+                    f"fold_{fold}/lr": optimizer.param_groups[0]["lr"],
+                    f"fold_{fold}/epoch_time": elapsed,
+                    "epoch": epoch,
+                })
+            except Exception as e:
+                print(f"  WARNING: wandb.log() failed: {e}")
+
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"  Epoch {epoch:3d}/{epochs} | "
@@ -187,11 +210,15 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
                 f"{elapsed:.1f}s"
             )
 
+    if use_wandb:
+        wandb.summary[f"fold_{fold}/best_acc"] = best_acc
+        wandb.unwatch(model)
+
     print(f"\n  Fold {fold} best accuracy: {best_acc:.1f}%")
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
 
@@ -202,6 +229,34 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
     print(f"  Device: {device}")
     print(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"{'#'*60}")
+
+    if use_wandb:
+        run_name = f"longseq_n{n_clips}_{mode}" if n_clips > 1 else f"{dataset}_{mode}"
+        try:
+            wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=run_name,
+                config={
+                    "dataset": dataset,
+                    "mode": mode,
+                    "n_clips": n_clips,
+                    "n_pool_tokens": n_pool_tokens,
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "weight_decay": 0.05,
+                    "mixup_alpha": 0.3,
+                    "grad_clip": 1.0,
+                    "lr_min": 1e-6,
+                    "n_layers": N_LAYERS,
+                    "num_folds": num_folds,
+                    "device": str(device),
+                },
+            )
+        except Exception as e:
+            print(f"WARNING: wandb.init() failed: {e}. Disabling wandb for this run.")
+            use_wandb = False
 
     fold_accuracies = []
     all_histories = {}
@@ -218,6 +273,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
             lr=lr,
             n_clips=n_clips,
             n_pool_tokens=n_pool_tokens,
+            use_wandb=use_wandb,
         )
         fold_accuracies.append(best_acc)
         all_histories[f"fold_{fold}"] = history
@@ -259,6 +315,14 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
         json.dump(results, f, indent=2)
     print(f"  Results saved to {result_file}")
 
+    if use_wandb:
+        wandb.summary["mean_accuracy"] = mean_acc
+        wandb.summary["std_accuracy"] = std_acc
+        for i, acc in enumerate(fold_accuracies, 1):
+            wandb.summary[f"fold_{i}/final_acc"] = acc
+        wandb.save(os.path.abspath(result_file), base_path=os.path.abspath("results"))
+        wandb.finish()
+
     return mean_acc, std_acc
 
 
@@ -275,7 +339,15 @@ def main():
     parser.add_argument("--n_clips", type=int, default=1,
                         help="Number of clips to concatenate (long-seq experiment)")
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="helix")
+    parser.add_argument("--wandb_entity", type=str, default=None)
     args = parser.parse_args()
+
+    use_wandb = args.wandb
+    if use_wandb and wandb is None:
+        print("WARNING: --wandb flag set but wandb is not installed. Disabling.")
+        use_wandb = False
 
     if args.data_root is None:
         args.data_root = DATASET_CONFIG[args.dataset]["default_root"]
@@ -312,6 +384,9 @@ def main():
             lr=args.lr,
             n_clips=args.n_clips,
             n_pool_tokens=n_pool_tokens,
+            use_wandb=use_wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
         )
         results[mode] = {"mean": mean, "std": std}
 
