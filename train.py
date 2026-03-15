@@ -349,7 +349,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                 config={
                     "dataset": dataset,
                     "mode": mode,
-                    "num_classes": len(_build_tedlium_index(data_root, "train")[1]) if dataset == "tedlium" else cfg["num_classes"],
+                    "num_classes": len(_build_tedlium_index(data_root)[1]) if dataset == "tedlium" else cfg["num_classes"],
                     "n_clips": n_clips,
                     "n_pool_tokens": n_pool_tokens,
                     "epochs": epochs,
@@ -493,7 +493,7 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if args.dataset not in ("speechcommands",) and not os.path.exists(args.data_root):  # noqa: E501
+    if args.dataset not in ("speechcommands", "tedlium") and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         if args.dataset == "urbansound8k":
             print("\nDownload UrbanSound8K from:")
@@ -508,7 +508,7 @@ def main():
             print("\nDownload TEDLIUM Release 3 from:")
             print("  https://www.openslr.org/51/")
             print("\nExtract so the structure is:")
-            print("  data/TEDLIUM_release-3/train/{stm/,sph/}")
+            print("  data/TEDLIUM_release-3/data/{stm/,sph/}")
         else:
             print("\nTo download:")
             print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")

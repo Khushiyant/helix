@@ -658,8 +658,37 @@ def _parse_tedlium_stm(stm_path):
     return segments
 
 
-def _build_tedlium_index(root, subset):
+_TEDLIUM_URL = "https://www.openslr.org/resources/51/TEDLIUM_release-3.tgz"
+
+
+def _download_tedlium(root):
+    """Download and extract TEDLIUM release 3 if not already present."""
+    import tarfile
+    import urllib.request
+
+    data_dir = os.path.join(root, "data", "stm")
+    if os.path.isdir(data_dir) and os.listdir(data_dir):
+        return
+
+    os.makedirs(root, exist_ok=True)
+    tar_path = os.path.join(os.path.dirname(root), "TEDLIUM_release-3.tgz")
+
+    if not os.path.exists(tar_path):
+        print(f"  Downloading TEDLIUM release 3 (~50GB)...")
+        urllib.request.urlretrieve(_TEDLIUM_URL, tar_path)
+
+    print(f"  Extracting to {root}...")
+    with tarfile.open(tar_path, "r:gz") as tar:
+        tar.extractall(os.path.dirname(root))
+
+    if os.path.exists(tar_path):
+        os.remove(tar_path)
+    print(f"  TEDLIUM ready at {root}")
+
+
+def _build_tedlium_index(root, subset="data"):
     """Build index of (sph_path, segments) for a TEDLium subset."""
+    _download_tedlium(root)
     stm_dir = os.path.join(root, subset, "stm")
     sph_dir = os.path.join(root, subset, "sph")
     if not os.path.isdir(stm_dir):
@@ -862,7 +891,7 @@ def get_tedlium_dataloaders(root, test_fold=1, batch_size=32, mode="raw", target
     DatasetClass = TEDLIUMRaw if mode == "raw" else TEDLIUMSpectrogram
 
     print(f"\nCreating TEDLIUM {mode} dataloaders ({target_seconds}s clips, speaker ID)")
-    speaker_segments, speaker_to_idx = _build_tedlium_index(root, "train")
+    speaker_segments, speaker_to_idx = _build_tedlium_index(root)
     train_segs, val_segs = _split_tedlium_by_utterance(speaker_segments)
 
     train_dataset = DatasetClass(
