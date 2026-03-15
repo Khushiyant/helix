@@ -658,31 +658,51 @@ def _parse_tedlium_stm(stm_path):
     return segments
 
 
-_TEDLIUM_URL = "https://www.openslr.org/resources/51/TEDLIUM_release-3.tgz"
+_TEDLIUM_URL = "http://www.openslr.org/resources/51/TEDLIUM_release-3.tgz"
 
 
 def _download_tedlium(root):
     """Download and extract TEDLIUM release 3 if not already present."""
+    import subprocess
     import tarfile
-    import urllib.request
 
     data_dir = os.path.join(root, "data", "stm")
     if os.path.isdir(data_dir) and os.listdir(data_dir):
         return
 
-    os.makedirs(root, exist_ok=True)
-    tar_path = os.path.join(os.path.dirname(root), "TEDLIUM_release-3.tgz")
+    parent = os.path.dirname(root)
+    os.makedirs(parent, exist_ok=True)
+    tar_path = os.path.join(parent, "TEDLIUM_release-3.tgz")
 
     if not os.path.exists(tar_path):
         print(f"  Downloading TEDLIUM release 3 (~50GB)...")
-        urllib.request.urlretrieve(_TEDLIUM_URL, tar_path)
+        ret = subprocess.run(
+            ["curl", "-L", "-o", tar_path, "--progress-bar", _TEDLIUM_URL],
+            check=False,
+        )
+        if ret.returncode != 0:
+            if os.path.exists(tar_path):
+                os.remove(tar_path)
+            raise RuntimeError(
+                f"Download failed (curl exit {ret.returncode}). "
+                f"Download manually:\n  curl -L -o {tar_path} {_TEDLIUM_URL}"
+            )
+
+    # Validate it's actually gzip before extracting
+    with open(tar_path, "rb") as f:
+        magic = f.read(2)
+    if magic != b'\x1f\x8b':
+        os.remove(tar_path)
+        raise RuntimeError(
+            f"Downloaded file is not a valid gzip archive (got {magic!r}). "
+            f"Download manually:\n  curl -L -o {tar_path} {_TEDLIUM_URL}"
+        )
 
     print(f"  Extracting to {root}...")
     with tarfile.open(tar_path, "r:gz") as tar:
-        tar.extractall(os.path.dirname(root))
+        tar.extractall(parent)
 
-    if os.path.exists(tar_path):
-        os.remove(tar_path)
+    os.remove(tar_path)
     print(f"  TEDLIUM ready at {root}")
 
 
