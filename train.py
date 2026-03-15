@@ -207,6 +207,7 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
 
     if use_wandb:
         wandb.watch(model, log="gradients", log_freq=50)
+        wandb.config.update({"param_count": param_count}, allow_val_change=True)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.05)
@@ -296,6 +297,14 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
 
     if use_wandb:
         wandb.summary[f"fold_{fold}/best_acc"] = best_acc
+        best_ckpt = _ckpt_path(dataset, mode, fold, tag="best")
+        if os.path.exists(best_ckpt):
+            artifact = wandb.Artifact(
+                f"{dataset}_{mode}_fold{fold}_best", type="model",
+                metadata={"fold": fold, "best_acc": best_acc},
+            )
+            artifact.add_file(best_ckpt)
+            wandb.log_artifact(artifact)
         wandb.unwatch(model)
 
     print(f"\n  Fold {fold} best accuracy: {best_acc:.1f}%")
@@ -326,6 +335,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                 config={
                     "dataset": dataset,
                     "mode": mode,
+                    "num_classes": cfg["num_classes"],
                     "n_clips": n_clips,
                     "n_pool_tokens": n_pool_tokens,
                     "epochs": epochs,
@@ -338,8 +348,12 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                     "n_layers": N_LAYERS,
                     "num_folds": num_folds,
                     "device": str(device),
+                    "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+                    "gpu_vram_gb": round(torch.cuda.get_device_properties(device).total_mem / 1e9, 1) if device.type == "cuda" else 0,
                     "use_amp": use_amp,
                     "grad_accum_steps": grad_accum_steps,
+                    "save_every": save_every,
+                    "resume": resume,
                 },
             )
         except Exception as e:
