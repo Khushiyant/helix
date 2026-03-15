@@ -636,6 +636,263 @@ def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  
     return train_loader, test_loader
 
 
+def _parse_tedlium_stm(stm_path):
+    """Parse a single STM file into a list of (start, end, speaker_id) segments."""
+    segments = []
+    with open(stm_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(";;"):
+                continue
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            speaker_id = parts[2]
+            if speaker_id == "inter_segment_gap":
+                continue
+            start = float(parts[3])
+            end = float(parts[4])
+            if end - start < 0.5:
+                continue
+            segments.append((start, end, speaker_id))
+    return segments
+
+
+def _build_tedlium_index(root, subset):
+    """Build index of (sph_path, segments) for a TEDLium subset."""
+    stm_dir = os.path.join(root, subset, "stm")
+    sph_dir = os.path.join(root, subset, "sph")
+    if not os.path.isdir(stm_dir):
+        raise FileNotFoundError(f"TEDLium STM dir not found: {stm_dir}")
+
+    speaker_segments = {}
+    for stm_file in sorted(os.listdir(stm_dir)):
+        if not stm_file.endswith(".stm"):
+            continue
+        talk_id = stm_file.replace(".stm", "")
+        sph_path = os.path.join(sph_dir, f"{talk_id}.sph")
+        if not os.path.exists(sph_path):
+            continue
+        for start, end, speaker_id in _parse_tedlium_stm(os.path.join(stm_dir, stm_file)):
+            speaker_segments.setdefault(speaker_id, []).append((sph_path, start, end))
+
+    speakers = sorted(speaker_segments.keys())
+    speaker_to_idx = {s: i for i, s in enumerate(speakers)}
+    return speaker_segments, speaker_to_idx
+
+
+def _split_tedlium_by_utterance(speaker_segments, val_ratio=0.2, seed=42):
+    """Hold out utterances per speaker so every speaker is seen during training."""
+    rng = np.random.RandomState(seed)
+    train_segs = {}
+    val_segs = {}
+    for speaker_id in sorted(speaker_segments.keys()):
+        utterances = list(speaker_segments[speaker_id])
+        rng.shuffle(utterances)
+        n_val = max(1, int(len(utterances) * val_ratio))
+        val_segs[speaker_id] = utterances[:n_val]
+        train_segs[speaker_id] = utterances[n_val:]
+    return train_segs, val_segs
+
+
+class TEDLIUMRaw(Dataset):
+    """TEDLium speaker ID dataset. Stitches segments from the same speaker
+    to create clips of a target duration for scaling experiments."""
+
+    def __init__(self, speaker_segments, speaker_to_idx, target_seconds=30, augment=False):
+        self.speaker_to_idx = speaker_to_idx
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = int(target_seconds * self.target_sr)
+        self.target_seconds = target_seconds
+
+        self.samples = []
+        for speaker_id in sorted(speaker_segments.keys()):
+            segs = speaker_segments[speaker_id]
+            total_dur = sum(end - start for _, start, end in segs)
+            n_samples = max(1, int(total_dur / target_seconds))
+            for i in range(n_samples):
+                self.samples.append((speaker_id, i, n_samples))
+
+        self.speaker_segments = speaker_segments
+        n_speakers = len(speaker_segments)
+        print(f"  Loaded {len(self.samples)} samples ({n_speakers} speakers, {target_seconds}s clips)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_segment(self, sph_path, start, end):
+        frame_start = int(start * self.target_sr)
+        num_frames = int((end - start) * self.target_sr)
+        try:
+            data, sr = sf.read(sph_path, start=frame_start, frames=num_frames,
+                               dtype="float32", always_2d=True)
+        except Exception:
+            return torch.zeros(1, num_frames)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+        return waveform
+
+    def _augment(self, waveform):
+        shift = np.random.randint(-self.target_sr, self.target_sr)
+        waveform = torch.roll(waveform, shift, dims=-1)
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+        return waveform
+
+    def __getitem__(self, idx):
+        speaker_id, sample_idx, n_speaker_samples = self.samples[idx]
+        segs = self.speaker_segments[speaker_id]
+
+        rng = np.random.RandomState(idx) if not self.augment else np.random
+        order = list(range(len(segs)))
+        rng.shuffle(order)
+        start_seg = (sample_idx * len(segs) // n_speaker_samples) % len(segs)
+        order = order[start_seg:] + order[:start_seg]
+
+        parts = []
+        collected = 0
+        for seg_idx in order:
+            if collected >= self.target_length:
+                break
+            sph_path, start, end = segs[seg_idx]
+            chunk = self._load_segment(sph_path, start, end)
+            parts.append(chunk)
+            collected += chunk.shape[1]
+
+        waveform = torch.cat(parts, dim=-1) if parts else torch.zeros(1, self.target_length)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, self.speaker_to_idx[speaker_id]
+
+
+class TEDLIUMSpectrogram(Dataset):
+
+    def __init__(self, speaker_segments, speaker_to_idx, target_seconds=30, augment=False):
+        self.speaker_to_idx = speaker_to_idx
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = int(target_seconds * self.target_sr)
+        self.target_seconds = target_seconds
+
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=16000, n_fft=1024, hop_length=512, n_mels=128, power=2.0,
+        )
+        self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
+
+        self.samples = []
+        for speaker_id in sorted(speaker_segments.keys()):
+            segs = speaker_segments[speaker_id]
+            total_dur = sum(end - start for _, start, end in segs)
+            n_samples = max(1, int(total_dur / target_seconds))
+            for i in range(n_samples):
+                self.samples.append((speaker_id, i, n_samples))
+
+        self.speaker_segments = speaker_segments
+        n_speakers = len(speaker_segments)
+        print(f"  Loaded {len(self.samples)} samples ({n_speakers} speakers, {target_seconds}s clips)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_segment(self, sph_path, start, end):
+        frame_start = int(start * self.target_sr)
+        num_frames = int((end - start) * self.target_sr)
+        try:
+            data, sr = sf.read(sph_path, start=frame_start, frames=num_frames,
+                               dtype="float32", always_2d=True)
+        except Exception:
+            return torch.zeros(1, num_frames)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+        return waveform
+
+    def __getitem__(self, idx):
+        speaker_id, sample_idx, n_speaker_samples = self.samples[idx]
+        segs = self.speaker_segments[speaker_id]
+
+        rng = np.random.RandomState(idx) if not self.augment else np.random
+        order = list(range(len(segs)))
+        rng.shuffle(order)
+        start_seg = (sample_idx * len(segs) // n_speaker_samples) % len(segs)
+        order = order[start_seg:] + order[:start_seg]
+
+        parts = []
+        collected = 0
+        for seg_idx in order:
+            if collected >= self.target_length:
+                break
+            sph_path, start, end = segs[seg_idx]
+            chunk = self._load_segment(sph_path, start, end)
+            parts.append(chunk)
+            collected += chunk.shape[1]
+
+        waveform = torch.cat(parts, dim=-1) if parts else torch.zeros(1, self.target_length)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        mel = self.mel_transform(waveform)
+        mel = self.amplitude_to_db(mel)
+        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+
+        return mel, self.speaker_to_idx[speaker_id]
+
+
+def get_tedlium_dataloaders(root, test_fold=1, batch_size=32, mode="raw", target_seconds=30):  # noqa: ARG001
+    DatasetClass = TEDLIUMRaw if mode == "raw" else TEDLIUMSpectrogram
+
+    print(f"\nCreating TEDLIUM {mode} dataloaders ({target_seconds}s clips, speaker ID)")
+    speaker_segments, speaker_to_idx = _build_tedlium_index(root, "train")
+    train_segs, val_segs = _split_tedlium_by_utterance(speaker_segments)
+
+    train_dataset = DatasetClass(
+        train_segs, speaker_to_idx,
+        target_seconds=target_seconds, augment=True,
+    )
+    test_dataset = DatasetClass(
+        val_segs, speaker_to_idx,
+        target_seconds=target_seconds, augment=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, test_loader, len(speaker_to_idx)
+
+
 def get_dataloaders(root, test_fold, batch_size=32, mode="raw"):
     all_folds = [1, 2, 3, 4, 5]
     train_folds = [f for f in all_folds if f != test_fold]
@@ -720,7 +977,18 @@ if __name__ == "__main__":
 
     dataset = sys.argv[1] if len(sys.argv) > 1 else "esc50"
 
-    if dataset == "librispeech":
+    if dataset == "tedlium":
+        root = sys.argv[2] if len(sys.argv) > 2 else "data/TEDLIUM_release-3"
+        if not os.path.exists(root):
+            print(f"TEDLIUM not found at {root}")
+            print("Download from: https://www.openslr.org/51/")
+            exit(1)
+
+        for secs in [30, 60]:
+            train_loader, test_loader, n_speakers = get_tedlium_dataloaders(root, mode="raw", target_seconds=secs)
+            batch = next(iter(train_loader))
+            print(f"Raw {secs}s batch: input={batch[0].shape}, labels={batch[1].shape}, speakers={n_speakers}")
+    elif dataset == "librispeech":
         root = sys.argv[2] if len(sys.argv) > 2 else "data/LibriSpeech"
         if not os.path.exists(root):
             print(f"LibriSpeech not found at {root}")
