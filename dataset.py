@@ -27,9 +27,16 @@ class ESC50Raw(Dataset):
     def _load_and_resample(self, path):
         data, sr = sf.read(path, dtype="float32", always_2d=True)
         waveform = torch.from_numpy(data.T)  # shape: (channels, time)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         if sr != self.target_sr:
             resampler = T.Resample(orig_freq=sr, new_freq=self.target_sr)
             waveform = resampler(waveform)
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
         return waveform
 
     def _augment(self, waveform):
@@ -472,23 +479,27 @@ def _discover_librispeech_files(root, subset):
     return files, speaker_to_idx
 
 
-def _split_librispeech_by_speaker(root, subset="train-clean-100", val_ratio=0.2, seed=42):
-    """Split a single LibriSpeech subset into train/val by speaker.
+def _split_librispeech_by_utterance(root, subset="train-clean-100", val_ratio=0.2, seed=42):
+    """Split a single LibriSpeech subset into train/val by utterance per speaker.
 
-    LibriSpeech train/dev/test have non-overlapping speakers,
-    so we must split within one subset for speaker ID classification.
+    Every speaker appears in both splits so the classifier sees all speakers
+    during training. Utterances are held out, not speakers.
     """
     files, speaker_to_idx = _discover_librispeech_files(root, subset)
 
-    speakers = sorted(speaker_to_idx.keys())
+    speaker_files = {}
+    for path, speaker_id in files:
+        speaker_files.setdefault(speaker_id, []).append((path, speaker_id))
+
     rng = np.random.RandomState(seed)
-    rng.shuffle(speakers)
-
-    n_val = max(1, int(len(speakers) * val_ratio))
-    val_speakers = set(speakers[:n_val])
-
-    train_files = [(p, s) for p, s in files if s not in val_speakers]
-    val_files = [(p, s) for p, s in files if s in val_speakers]
+    train_files = []
+    val_files = []
+    for speaker_id in sorted(speaker_files.keys()):
+        utterances = speaker_files[speaker_id]
+        rng.shuffle(utterances)
+        n_val = max(1, int(len(utterances) * val_ratio))
+        val_files.extend(utterances[:n_val])
+        train_files.extend(utterances[n_val:])
 
     return train_files, val_files, speaker_to_idx
 
@@ -602,7 +613,7 @@ def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  
     DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
 
     print(f"\nCreating LibriSpeech {mode} dataloaders (speaker ID classification)")
-    train_files, val_files, speaker_to_idx = _split_librispeech_by_speaker(root)
+    train_files, val_files, speaker_to_idx = _split_librispeech_by_utterance(root)
     train_dataset = DatasetClass(train_files, speaker_to_idx, augment=True)
     test_dataset = DatasetClass(val_files, speaker_to_idx, augment=False)
 
@@ -716,7 +727,7 @@ if __name__ == "__main__":
             print("Download from: https://www.openslr.org/12")
             exit(1)
 
-        train_files, val_files, speaker_to_idx = _split_librispeech_by_speaker(root)
+        train_files, val_files, speaker_to_idx = _split_librispeech_by_utterance(root)
         print(f"Speakers: {len(speaker_to_idx)} total, "
               f"{len(set(s for _,s in train_files))} train, "
               f"{len(set(s for _,s in val_files))} val")

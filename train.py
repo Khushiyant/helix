@@ -211,6 +211,9 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    if use_amp and device.type != "cuda":
+        print("  WARNING: --amp requires CUDA, disabling AMP for this fold")
+        use_amp = False
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     best_acc = 0
@@ -464,8 +467,8 @@ def main():
         elif args.dataset == "librispeech":
             print("\nDownload LibriSpeech from:")
             print("  https://www.openslr.org/12")
-            print("\nDownload train-clean-100 and test-clean, extract so the structure is:")
-            print("  data/LibriSpeech/{train-clean-100/,test-clean/}")
+            print("\nDownload train-clean-100, extract so the structure is:")
+            print("  data/LibriSpeech/train-clean-100/<speaker_id>/<chapter_id>/*.flac")
         else:
             print("\nTo download:")
             print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")

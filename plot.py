@@ -80,16 +80,17 @@ def plot_training_curves(data, out_dir):
 def plot_fold_comparison(data, out_dir):
     modes = list(data.keys())
     n_modes = len(modes)
-    x = np.arange(5)
+    n_folds = max(len(data[m]["fold_accuracies"]) for m in modes)
+    x = np.arange(n_folds)
     width = 0.8 / n_modes
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(max(8, n_folds * 1.5), 5))
     for i, mode in enumerate(modes):
         accs = data[mode]["fold_accuracies"]
         color = COLORS.get(mode, "#999999")
         label = LABELS.get(mode, mode)
         offset = (i - n_modes / 2 + 0.5) * width
-        bars = ax.bar(x + offset, accs, width, label=label, color=color, alpha=0.85)
+        bars = ax.bar(x[:len(accs)] + offset, accs, width, label=label, color=color, alpha=0.85)
         for bar, acc in zip(bars, accs):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
                     f"{acc:.1f}", ha="center", va="bottom", fontsize=7)
@@ -98,7 +99,7 @@ def plot_fold_comparison(data, out_dir):
     ax.set_ylabel("Best Test Accuracy (%)")
     ax.set_title("Per-Fold Best Accuracy")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"Fold {i+1}" for i in range(5)])
+    ax.set_xticklabels([f"Fold {i+1}" for i in range(n_folds)])
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
 
@@ -124,7 +125,8 @@ def plot_summary(data, out_dir):
                 f"{mean:.1f}%", ha="center", va="bottom", fontweight="bold")
 
     ax.set_ylabel("Mean Accuracy (%)")
-    ax.set_title("5-Fold Cross Validation Results")
+    n_folds = max(len(data[m]["fold_accuracies"]) for m in modes)
+    ax.set_title(f"{n_folds}-Fold Cross Validation Results")
     ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
