@@ -3,7 +3,7 @@ name = "Helix"
 version = "0.1.0"
 description = "Mamba Hybrid: A versatile audio processing library for efficient and high-quality audio understanding."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.4.2",
     "pandas>=3.0.1",

@@ -448,6 +448,153 @@ class SpeechCommandsSpectrogram(Dataset):
         return mel, SPEECH_COMMANDS_LABEL_TO_IDX[label]
 
 
+def _discover_librispeech_files(root, subset):
+    """Walk LibriSpeech directory to find all FLAC files and speaker IDs."""
+    subset_dir = os.path.join(root, subset)
+    if not os.path.isdir(subset_dir):
+        raise FileNotFoundError(f"LibriSpeech subset not found: {subset_dir}")
+
+    files = []
+    for speaker_id in sorted(os.listdir(subset_dir)):
+        speaker_dir = os.path.join(subset_dir, speaker_id)
+        if not os.path.isdir(speaker_dir):
+            continue
+        for chapter_id in os.listdir(speaker_dir):
+            chapter_dir = os.path.join(speaker_dir, chapter_id)
+            if not os.path.isdir(chapter_dir):
+                continue
+            for fname in os.listdir(chapter_dir):
+                if fname.endswith(".flac"):
+                    files.append((os.path.join(chapter_dir, fname), speaker_id))
+
+    speakers = sorted(set(s for _, s in files))
+    speaker_to_idx = {s: i for i, s in enumerate(speakers)}
+    return files, speaker_to_idx
+
+
+class LibriSpeechRaw(Dataset):
+
+    def __init__(self, root, subset="train-clean-100", augment=False, speaker_to_idx=None):
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 160000  # 10 seconds at 16kHz
+
+        self.files, discovered_map = _discover_librispeech_files(root, subset)
+        self.speaker_to_idx = speaker_to_idx if speaker_to_idx is not None else discovered_map
+
+        print(f"  Loaded {len(self.files)} clips ({subset}, {len(self.speaker_to_idx)} speakers)")
+
+    def __len__(self):
+        return len(self.files)
+
+    def _augment(self, waveform):
+        shift = np.random.randint(-16000, 16000)
+        waveform = torch.roll(waveform, shift, dims=-1)
+
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+
+        return waveform
+
+    def __getitem__(self, idx):
+        path, speaker_id = self.files[idx]
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
+
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, self.speaker_to_idx[speaker_id]
+
+
+class LibriSpeechSpectrogram(Dataset):
+
+    def __init__(self, root, subset="train-clean-100", augment=False, speaker_to_idx=None):
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 160000
+
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=128,
+            power=2.0,
+        )
+        self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
+
+        self.files, discovered_map = _discover_librispeech_files(root, subset)
+        self.speaker_to_idx = speaker_to_idx if speaker_to_idx is not None else discovered_map
+
+        print(f"  Loaded {len(self.files)} clips ({subset}, {len(self.speaker_to_idx)} speakers)")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path, speaker_id = self.files[idx]
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
+
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        mel = self.mel_transform(waveform)
+        mel = self.amplitude_to_db(mel)
+        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+
+        return mel, self.speaker_to_idx[speaker_id]
+
+
+def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  # noqa: ARG001
+    DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
+
+    print(f"\nCreating LibriSpeech {mode} dataloaders (speaker ID classification)")
+    train_dataset = DatasetClass(root, subset="train-clean-100", augment=True)
+    speaker_to_idx = train_dataset.speaker_to_idx
+    test_dataset = DatasetClass(root, subset="test-clean", augment=False, speaker_to_idx=speaker_to_idx)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, test_loader
+
+
 def get_dataloaders(root, test_fold, batch_size=32, mode="raw"):
     all_folds = [1, 2, 3, 4, 5]
     train_folds = [f for f in all_folds if f != test_fold]
@@ -532,7 +679,21 @@ if __name__ == "__main__":
 
     dataset = sys.argv[1] if len(sys.argv) > 1 else "esc50"
 
-    if dataset == "speechcommands":
+    if dataset == "librispeech":
+        root = sys.argv[2] if len(sys.argv) > 2 else "data/LibriSpeech"
+        if not os.path.exists(root):
+            print(f"LibriSpeech not found at {root}")
+            print("Download from: https://www.openslr.org/12")
+            exit(1)
+
+        train_loader, test_loader = get_librispeech_dataloaders(root, mode="raw")
+        batch = next(iter(train_loader))
+        print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
+
+        train_loader, test_loader = get_librispeech_dataloaders(root, mode="spectrogram")
+        batch = next(iter(train_loader))
+        print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")
+    elif dataset == "speechcommands":
         root = sys.argv[2] if len(sys.argv) > 2 else "data"
 
         train_loader, test_loader = get_speechcommands_dataloaders(root, mode="raw")

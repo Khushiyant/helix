@@ -16,7 +16,7 @@ except ImportError:
     wandb = None
 
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders
 
 N_LAYERS = 6
 
@@ -24,6 +24,7 @@ DATASET_CONFIG = {
     "esc50": {"num_classes": 50, "num_folds": 5, "default_root": "data/ESC-50-master"},
     "urbansound8k": {"num_classes": 10, "num_folds": 10, "default_root": "data/UrbanSound8K"},
     "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
+    "librispeech": {"num_classes": 251, "num_folds": 1, "default_root": "data/LibriSpeech"},
 }
 
 
@@ -121,6 +122,10 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
         )
     elif dataset == "speechcommands":
         train_loader, test_loader = get_speechcommands_dataloaders(
+            root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
+        )
+    elif dataset == "librispeech":
+        train_loader, test_loader = get_librispeech_dataloaders(
             root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
         )
     elif dataset == "urbansound8k":
@@ -336,7 +341,7 @@ def main():
     parser.add_argument("--mode", type=str, default="raw",
                         choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
     parser.add_argument("--dataset", type=str, default="esc50",
-                        choices=["esc50", "urbansound8k", "speechcommands"])
+                        choices=["esc50", "urbansound8k", "speechcommands", "librispeech"])
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -364,12 +369,17 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if args.dataset != "speechcommands" and not os.path.exists(args.data_root):
+    if args.dataset not in ("speechcommands",) and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         if args.dataset == "urbansound8k":
             print("\nDownload UrbanSound8K from:")
             print("  https://urbansounddataset.weebly.com/urbansound8k.html")
             print("\nExtract so the structure is: data/UrbanSound8K/{audio/,metadata/}")
+        elif args.dataset == "librispeech":
+            print("\nDownload LibriSpeech from:")
+            print("  https://www.openslr.org/12")
+            print("\nDownload train-clean-100 and test-clean, extract so the structure is:")
+            print("  data/LibriSpeech/{train-clean-100/,test-clean/}")
         else:
             print("\nTo download:")
             print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")
