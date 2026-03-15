@@ -16,12 +16,13 @@ except ImportError:
     wandb = None
 
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders
 
 N_LAYERS = 6
 
 DATASET_CONFIG = {
     "esc50": {"num_classes": 50, "num_folds": 5, "default_root": "data/ESC-50-master"},
+    "urbansound8k": {"num_classes": 10, "num_folds": 10, "default_root": "data/UrbanSound8K"},
     "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
 }
 
@@ -120,6 +121,10 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
         )
     elif dataset == "speechcommands":
         train_loader, test_loader = get_speechcommands_dataloaders(
+            root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
+        )
+    elif dataset == "urbansound8k":
+        train_loader, test_loader = get_urbansound8k_dataloaders(
             root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
         )
     else:
@@ -331,7 +336,7 @@ def main():
     parser.add_argument("--mode", type=str, default="raw",
                         choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
     parser.add_argument("--dataset", type=str, default="esc50",
-                        choices=["esc50", "speechcommands"])
+                        choices=["esc50", "urbansound8k", "speechcommands"])
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -361,10 +366,15 @@ def main():
 
     if args.dataset != "speechcommands" and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
-        print("\nTo download:")
-        print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")
-        print("\nOr download from Kaggle:")
-        print("  https://www.kaggle.com/datasets/mmoreaux/environmental-sound-classification-50")
+        if args.dataset == "urbansound8k":
+            print("\nDownload UrbanSound8K from:")
+            print("  https://urbansounddataset.weebly.com/urbansound8k.html")
+            print("\nExtract so the structure is: data/UrbanSound8K/{audio/,metadata/}")
+        else:
+            print("\nTo download:")
+            print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")
+            print("\nOr download from Kaggle:")
+            print("  https://www.kaggle.com/datasets/mmoreaux/environmental-sound-classification-50")
         return
 
     n_pool_tokens = 100 if args.n_clips > 1 else None

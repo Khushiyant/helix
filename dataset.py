@@ -112,6 +112,146 @@ class ESC50Spectrogram(Dataset):
         return mel, label
 
 
+class UrbanSound8KRaw(Dataset):
+
+    def __init__(self, root, fold_list, augment=False):
+        self.audio_dir = os.path.join(root, "audio")
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 64000  # 4 seconds at 16kHz
+
+        meta = pd.read_csv(os.path.join(root, "metadata", "UrbanSound8K.csv"))
+        self.data = meta[meta["fold"].isin(fold_list)].reset_index(drop=True)
+
+        print(f"  Loaded {len(self.data)} clips from folds {fold_list}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def _load_and_resample(self, path):
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            resampler = T.Resample(orig_freq=sr, new_freq=self.target_sr)
+            waveform = resampler(waveform)
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+        return waveform
+
+    def _augment(self, waveform):
+        shift = np.random.randint(-6400, 6400)
+        waveform = torch.roll(waveform, shift, dims=-1)
+
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+
+        return waveform
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        path = os.path.join(self.audio_dir, f"fold{row['fold']}", row["slice_file_name"])
+        label = row["classID"]
+
+        waveform = self._load_and_resample(path)
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, label
+
+
+class UrbanSound8KSpectrogram(Dataset):
+
+    def __init__(self, root, fold_list, augment=False):
+        self.audio_dir = os.path.join(root, "audio")
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = 64000
+
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=128,
+            power=2.0,
+        )
+        self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
+
+        meta = pd.read_csv(os.path.join(root, "metadata", "UrbanSound8K.csv"))
+        self.data = meta[meta["fold"].isin(fold_list)].reset_index(drop=True)
+
+        print(f"  Loaded {len(self.data)} clips from folds {fold_list}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def _load_and_resample(self, path):
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            resampler = T.Resample(sr, self.target_sr)
+            waveform = resampler(waveform)
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+        return waveform
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        path = os.path.join(self.audio_dir, f"fold{row['fold']}", row["slice_file_name"])
+        label = row["classID"]
+
+        waveform = self._load_and_resample(path)
+
+        mel = self.mel_transform(waveform)
+        mel = self.amplitude_to_db(mel)
+
+        mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+
+        return mel, label
+
+
+def get_urbansound8k_dataloaders(root, test_fold, batch_size=32, mode="raw"):
+    all_folds = list(range(1, 11))
+    train_folds = [f for f in all_folds if f != test_fold]
+
+    DatasetClass = UrbanSound8KRaw if mode == "raw" else UrbanSound8KSpectrogram
+
+    print(f"\nCreating UrbanSound8K {mode} dataloaders (test fold: {test_fold})")
+    train_dataset = DatasetClass(root, train_folds, augment=True)
+    test_dataset = DatasetClass(root, [test_fold], augment=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, test_loader
+
+
 SPEECH_COMMANDS_LABELS = sorted([
     'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five',
     'follow', 'forward', 'four', 'go', 'happy', 'house', 'learn', 'left',
@@ -400,6 +540,20 @@ if __name__ == "__main__":
         print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
 
         train_loader, test_loader = get_speechcommands_dataloaders(root, mode="spectrogram")
+        batch = next(iter(train_loader))
+        print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")
+    elif dataset == "urbansound8k":
+        root = sys.argv[2] if len(sys.argv) > 2 else "data/UrbanSound8K"
+        if not os.path.exists(root):
+            print(f"UrbanSound8K not found at {root}")
+            print("Download from: https://urbansounddataset.weebly.com/urbansound8k.html")
+            exit(1)
+
+        train_loader, test_loader = get_urbansound8k_dataloaders(root, test_fold=10, mode="raw")
+        batch = next(iter(train_loader))
+        print(f"Raw waveform batch: input={batch[0].shape}, labels={batch[1].shape}")
+
+        train_loader, test_loader = get_urbansound8k_dataloaders(root, test_fold=10, mode="spectrogram")
         batch = next(iter(train_loader))
         print(f"Spectrogram batch:  input={batch[0].shape}, labels={batch[1].shape}")
     else:
