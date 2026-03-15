@@ -472,17 +472,38 @@ def _discover_librispeech_files(root, subset):
     return files, speaker_to_idx
 
 
+def _split_librispeech_by_speaker(root, subset="train-clean-100", val_ratio=0.2, seed=42):
+    """Split a single LibriSpeech subset into train/val by speaker.
+
+    LibriSpeech train/dev/test have non-overlapping speakers,
+    so we must split within one subset for speaker ID classification.
+    """
+    files, speaker_to_idx = _discover_librispeech_files(root, subset)
+
+    speakers = sorted(speaker_to_idx.keys())
+    rng = np.random.RandomState(seed)
+    rng.shuffle(speakers)
+
+    n_val = max(1, int(len(speakers) * val_ratio))
+    val_speakers = set(speakers[:n_val])
+
+    train_files = [(p, s) for p, s in files if s not in val_speakers]
+    val_files = [(p, s) for p, s in files if s in val_speakers]
+
+    return train_files, val_files, speaker_to_idx
+
+
 class LibriSpeechRaw(Dataset):
 
-    def __init__(self, root, subset="train-clean-100", augment=False, speaker_to_idx=None):
+    def __init__(self, files, speaker_to_idx, augment=False):
+        self.files = files
+        self.speaker_to_idx = speaker_to_idx
         self.augment = augment
         self.target_sr = 16000
         self.target_length = 160000  # 10 seconds at 16kHz
 
-        self.files, discovered_map = _discover_librispeech_files(root, subset)
-        self.speaker_to_idx = speaker_to_idx if speaker_to_idx is not None else discovered_map
-
-        print(f"  Loaded {len(self.files)} clips ({subset}, {len(self.speaker_to_idx)} speakers)")
+        n_speakers = len(set(s for _, s in files))
+        print(f"  Loaded {len(self.files)} clips ({n_speakers} speakers)")
 
     def __len__(self):
         return len(self.files)
@@ -501,7 +522,10 @@ class LibriSpeechRaw(Dataset):
 
     def __getitem__(self, idx):
         path, speaker_id = self.files[idx]
-        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception:
+            return torch.zeros(1, self.target_length), self.speaker_to_idx[speaker_id]
         waveform = torch.from_numpy(data.T)
 
         if waveform.shape[0] > 1:
@@ -523,7 +547,9 @@ class LibriSpeechRaw(Dataset):
 
 class LibriSpeechSpectrogram(Dataset):
 
-    def __init__(self, root, subset="train-clean-100", augment=False, speaker_to_idx=None):
+    def __init__(self, files, speaker_to_idx, augment=False):
+        self.files = files
+        self.speaker_to_idx = speaker_to_idx
         self.augment = augment
         self.target_sr = 16000
         self.target_length = 160000
@@ -537,17 +563,21 @@ class LibriSpeechSpectrogram(Dataset):
         )
         self.amplitude_to_db = T.AmplitudeToDB(stype="power", top_db=80)
 
-        self.files, discovered_map = _discover_librispeech_files(root, subset)
-        self.speaker_to_idx = speaker_to_idx if speaker_to_idx is not None else discovered_map
-
-        print(f"  Loaded {len(self.files)} clips ({subset}, {len(self.speaker_to_idx)} speakers)")
+        n_speakers = len(set(s for _, s in files))
+        print(f"  Loaded {len(self.files)} clips ({n_speakers} speakers)")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         path, speaker_id = self.files[idx]
-        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception:
+            waveform = torch.zeros(1, self.target_length)
+            mel = self.mel_transform(waveform)
+            mel = self.amplitude_to_db(mel)
+            return mel, self.speaker_to_idx[speaker_id]
         waveform = torch.from_numpy(data.T)
 
         if waveform.shape[0] > 1:
@@ -572,9 +602,9 @@ def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  
     DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
 
     print(f"\nCreating LibriSpeech {mode} dataloaders (speaker ID classification)")
-    train_dataset = DatasetClass(root, subset="train-clean-100", augment=True)
-    speaker_to_idx = train_dataset.speaker_to_idx
-    test_dataset = DatasetClass(root, subset="test-clean", augment=False, speaker_to_idx=speaker_to_idx)
+    train_files, val_files, speaker_to_idx = _split_librispeech_by_speaker(root)
+    train_dataset = DatasetClass(train_files, speaker_to_idx, augment=True)
+    test_dataset = DatasetClass(val_files, speaker_to_idx, augment=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -685,6 +715,11 @@ if __name__ == "__main__":
             print(f"LibriSpeech not found at {root}")
             print("Download from: https://www.openslr.org/12")
             exit(1)
+
+        train_files, val_files, speaker_to_idx = _split_librispeech_by_speaker(root)
+        print(f"Speakers: {len(speaker_to_idx)} total, "
+              f"{len(set(s for _,s in train_files))} train, "
+              f"{len(set(s for _,s in val_files))} val")
 
         train_loader, test_loader = get_librispeech_dataloaders(root, mode="raw")
         batch = next(iter(train_loader))

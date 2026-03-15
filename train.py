@@ -44,37 +44,55 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True, n_pool_tokens=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True, n_pool_tokens=None, scaler=None, grad_accum_steps=1):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    use_amp = scaler is not None
 
-    for inputs, targets in loader:
+    optimizer.zero_grad()
+    for step, (inputs, targets) in enumerate(loader):
         inputs = inputs.to(device)
         targets = targets.to(device)
 
-        if use_mixup:
-            inputs, targets_a, targets_b, lam = mixup(inputs, targets, alpha=0.3)
-            outputs = model(inputs, n_pool_tokens=n_pool_tokens)
-            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+        with torch.autocast(device_type="cuda", enabled=use_amp):
+            if use_mixup:
+                inputs, targets_a, targets_b, lam = mixup(inputs, targets, alpha=0.3)
+                outputs = model(inputs, n_pool_tokens=n_pool_tokens)
+                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+            else:
+                outputs = model(inputs, n_pool_tokens=n_pool_tokens)
+                loss = criterion(outputs, targets)
 
+        scaled_loss = loss / grad_accum_steps
+
+        if use_amp:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        if use_mixup:
             _, predicted = outputs.max(1)
             correct += (lam * predicted.eq(targets_a).sum().item()
                         + (1 - lam) * predicted.eq(targets_b).sum().item())
         else:
-            outputs = model(inputs, n_pool_tokens=n_pool_tokens)
-            loss = criterion(outputs, targets)
             _, predicted = outputs.max(1)
             correct += predicted.eq(targets).sum().item()
 
         total += targets.size(0)
         total_loss += loss.item()
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad()
 
     avg_loss = total_loss / len(loader)
     accuracy = 100.0 * correct / total
@@ -82,7 +100,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True,
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, n_pool_tokens=None):
+def evaluate(model, loader, criterion, device, n_pool_tokens=None, use_amp=False):
     model.eval()
     total_loss = 0
     correct = 0
@@ -92,8 +110,9 @@ def evaluate(model, loader, criterion, device, n_pool_tokens=None):
         inputs = inputs.to(device)
         targets = targets.to(device)
 
-        outputs = model(inputs, n_pool_tokens=n_pool_tokens)
-        loss = criterion(outputs, targets)
+        with torch.autocast(device_type="cuda", enabled=use_amp):
+            outputs = model(inputs, n_pool_tokens=n_pool_tokens)
+            loss = criterion(outputs, targets)
 
         _, predicted = outputs.max(1)
         correct += predicted.eq(targets).sum().item()
@@ -105,14 +124,44 @@ def evaluate(model, loader, criterion, device, n_pool_tokens=None):
     return avg_loss, accuracy
 
 
-def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False):
+def _ckpt_path(dataset, mode, fold, tag="best"):
+    os.makedirs("checkpoints", exist_ok=True)
+    prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
+    return f"checkpoints/{prefix}_fold{fold}_{tag}.pt"
+
+
+def _save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best_acc, history):
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        "best_acc": best_acc,
+        "history": history,
+    }, path)
+
+
+def _load_checkpoint(path, model, optimizer, scheduler, scaler, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    if scaler is not None and ckpt["scaler_state_dict"] is not None:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    return ckpt["epoch"], ckpt["best_acc"], ckpt["history"]
+
+
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
     num_classes = cfg["num_classes"]
 
     print(f"\n{'='*60}")
     print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}" +
-          (f" — n_clips: {n_clips}" if n_clips > 1 else ""))
+          (f" — n_clips: {n_clips}" if n_clips > 1 else "") +
+          (" — AMP" if use_amp else "") +
+          (f" — grad_accum: {grad_accum_steps}" if grad_accum_steps > 1 else ""))
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
@@ -162,30 +211,41 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     best_acc = 0
+    start_epoch = 1
     history = []
 
-    for epoch in range(1, epochs + 1):
+    resume_path = _ckpt_path(dataset, mode, fold, tag="latest")
+    if resume and os.path.exists(resume_path):
+        start_epoch_loaded, best_acc, history = _load_checkpoint(
+            resume_path, model, optimizer, scheduler, scaler, device,
+        )
+        start_epoch = start_epoch_loaded + 1
+        print(f"  Resumed from epoch {start_epoch_loaded} (best_acc={best_acc:.1f}%)")
+
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
             n_pool_tokens=n_pool_tokens,
+            scaler=scaler,
+            grad_accum_steps=grad_accum_steps,
         )
         test_loss, test_acc = evaluate(model, test_loader, criterion, device,
-                                       n_pool_tokens=n_pool_tokens)
+                                       n_pool_tokens=n_pool_tokens,
+                                       use_amp=use_amp)
         scheduler.step()
 
         elapsed = time.time() - t0
 
         if test_acc > best_acc:
             best_acc = test_acc
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
-            torch.save(
-                model.state_dict(),
-                f"checkpoints/{ckpt_prefix}_fold{fold}_best.pt"
+            _save_checkpoint(
+                _ckpt_path(dataset, mode, fold, tag="best"),
+                model, optimizer, scheduler, scaler, epoch, best_acc, history,
             )
 
         history.append({
@@ -195,6 +255,17 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
             "test_loss": test_loss,
             "test_acc": test_acc,
         })
+
+        # Periodic + latest checkpoint for resume
+        if save_every > 0 and epoch % save_every == 0:
+            _save_checkpoint(
+                _ckpt_path(dataset, mode, fold, tag=f"epoch{epoch}"),
+                model, optimizer, scheduler, scaler, epoch, best_acc, history,
+            )
+        _save_checkpoint(
+            _ckpt_path(dataset, mode, fold, tag="latest"),
+            model, optimizer, scheduler, scaler, epoch, best_acc, history,
+        )
 
         if use_wandb:
             try:
@@ -211,7 +282,7 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
             except Exception as e:
                 print(f"  WARNING: wandb.log() failed: {e}")
 
-        if epoch % 10 == 0 or epoch == 1:
+        if epoch % 10 == 0 or epoch == start_epoch:
             print(
                 f"  Epoch {epoch:3d}/{epochs} | "
                 f"Train: {train_loss:.4f} / {train_acc:.1f}% | "
@@ -228,7 +299,7 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
 
@@ -238,6 +309,8 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
         print(f"  Long-seq: n_clips={n_clips}, total_audio={n_clips}s, total_tokens={n_clips * 100}")
     print(f"  Device: {device}")
     print(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
+    if use_amp:
+        print(f"  AMP: enabled, Grad accum: {grad_accum_steps}")
     print(f"{'#'*60}")
 
     if use_wandb:
@@ -262,6 +335,8 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                     "n_layers": N_LAYERS,
                     "num_folds": num_folds,
                     "device": str(device),
+                    "use_amp": use_amp,
+                    "grad_accum_steps": grad_accum_steps,
                 },
             )
         except Exception as e:
@@ -284,6 +359,10 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
             n_clips=n_clips,
             n_pool_tokens=n_pool_tokens,
             use_wandb=use_wandb,
+            use_amp=use_amp,
+            grad_accum_steps=grad_accum_steps,
+            save_every=save_every,
+            resume=resume,
         )
         fold_accuracies.append(best_acc)
         all_histories[f"fold_{fold}"] = history
@@ -349,6 +428,13 @@ def main():
     parser.add_argument("--n_clips", type=int, default=1,
                         help="Number of clips to concatenate (long-seq experiment)")
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training (AMP)")
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+    parser.add_argument("--save_every", type=int, default=0,
+                        help="Save periodic checkpoint every N epochs (0=disabled, latest always saved)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="helix")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -407,6 +493,10 @@ def main():
             use_wandb=use_wandb,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
+            use_amp=args.amp,
+            grad_accum_steps=args.grad_accum,
+            save_every=args.save_every,
+            resume=args.resume,
         )
         results[mode] = {"mean": mean, "std": std}
 
