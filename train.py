@@ -491,7 +491,7 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if args.dataset not in ("speechcommands",) and not os.path.exists(args.data_root):
+    if args.dataset not in ("speechcommands", "librispeech") and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         if args.dataset == "urbansound8k":
             print("\nDownload UrbanSound8K from:")
