@@ -179,7 +179,7 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
             root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
         )
     elif dataset == "librispeech":
-        train_loader, test_loader = get_librispeech_dataloaders(
+        train_loader, test_loader, num_classes = get_librispeech_dataloaders(
             root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
         )
     elif dataset == "urbansound8k":
@@ -361,7 +361,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                     "num_folds": num_folds,
                     "device": str(device),
                     "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
-                    "gpu_vram_gb": round(torch.cuda.get_device_properties(device).total_mem / 1e9, 1) if device.type == "cuda" else 0,
+                    "gpu_vram_gb": round(torch.cuda.get_device_properties(device).total_memory / 1e9, 1) if device.type == "cuda" else 0,
                     "use_amp": use_amp,
                     "grad_accum_steps": grad_accum_steps,
                     "save_every": save_every,
@@ -497,11 +497,6 @@ def main():
             print("\nDownload UrbanSound8K from:")
             print("  https://urbansounddataset.weebly.com/urbansound8k.html")
             print("\nExtract so the structure is: data/UrbanSound8K/{audio/,metadata/}")
-        elif args.dataset == "librispeech":
-            print("\nDownload LibriSpeech from:")
-            print("  https://www.openslr.org/12")
-            print("\nDownload train-clean-100, extract so the structure is:")
-            print("  data/LibriSpeech/train-clean-100/<speaker_id>/<chapter_id>/*.flac")
         else:
             print("\nTo download:")
             print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")

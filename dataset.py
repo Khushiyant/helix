@@ -628,7 +628,7 @@ def _download_librispeech_hf(root):
     from datasets import Audio
 
     print("  Downloading LibriSpeech train-clean-100 from HuggingFace...")
-    ds = load_dataset("openslr/librispeech_asr", "clean", split="train.360")
+    ds = load_dataset("openslr/librispeech_asr", "clean", split="train.100")
     # Disable automatic audio decoding (avoids torchcodec/FFmpeg dependency)
     ds = ds.cast_column("audio", Audio(decode=False))
 
@@ -839,7 +839,7 @@ def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  
         pin_memory=True,
     )
 
-    return train_loader, test_loader
+    return train_loader, test_loader, len(speaker_to_idx)
 
 
 

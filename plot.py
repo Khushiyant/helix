@@ -21,14 +21,18 @@ LABELS = {
 
 
 def load_results(results_dir, modes):
+    import glob
     data = {}
     for mode in modes:
-        path = os.path.join(results_dir, f"{mode}_results.json")
-        if os.path.exists(path):
+        # Match timestamped filenames produced by train.py (e.g. *_raw_20260316_1200.json)
+        pattern = os.path.join(results_dir, f"*_{mode}_*.json")
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            path = matches[-1]  # latest by filename (timestamp suffix)
             with open(path) as f:
                 data[mode] = json.load(f)
         else:
-            print(f"Warning: {path} not found, skipping")
+            print(f"Warning: no result file matching '*_{mode}_*.json' in {results_dir}, skipping")
     return data
 
 
