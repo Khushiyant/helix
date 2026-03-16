@@ -16,7 +16,7 @@ except ImportError:
     wandb = None
 
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders, get_tedlium_dataloaders, _build_tedlium_index
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders
 
 N_LAYERS = 6
 
@@ -25,7 +25,6 @@ DATASET_CONFIG = {
     "urbansound8k": {"num_classes": 10, "num_folds": 10, "default_root": "data/UrbanSound8K"},
     "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
     "librispeech": {"num_classes": 251, "num_folds": 1, "default_root": "data/LibriSpeech"},
-    "tedlium": {"num_classes": 0, "num_folds": 1, "default_root": "data/TEDLIUM_release-3"},
 }
 
 
@@ -153,26 +152,20 @@ def _load_checkpoint(path, model, optimizer, scheduler, scaler, device):
     return ckpt["epoch"], ckpt["best_acc"], ckpt["history"]
 
 
-def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, use_amp=False, grad_accum_steps=1, save_every=0, resume=False, target_seconds=30):
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
     num_classes = cfg["num_classes"]
 
     print(f"\n{'='*60}")
     print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}" +
-          (f" — {target_seconds}s clips" if dataset == "tedlium" else "") +
           (f" — n_clips: {n_clips}" if n_clips > 1 else "") +
           (" — AMP" if use_amp else "") +
           (f" — grad_accum: {grad_accum_steps}" if grad_accum_steps > 1 else ""))
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
-    if dataset == "tedlium":
-        train_loader, test_loader, num_classes = get_tedlium_dataloaders(
-            root=data_root, test_fold=fold, batch_size=batch_size, mode=data_mode,
-            target_seconds=target_seconds,
-        )
-    elif dataset == "speechcommands" and n_clips > 1:
+    if dataset == "speechcommands" and n_clips > 1:
         train_loader, test_loader = get_concat_speechcommands_dataloaders(
             root=data_root, n_clips=n_clips, batch_size=batch_size,
         )
@@ -318,14 +311,12 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None, use_amp=False, grad_accum_steps=1, save_every=0, resume=False, target_seconds=30):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
 
     print(f"\n{'#'*60}")
     print(f"  EXPERIMENT: {mode.upper()} — Dataset: {dataset}")
-    if dataset == "tedlium":
-        print(f"  Scaling: {target_seconds}s clips")
     if n_clips > 1:
         print(f"  Long-seq: n_clips={n_clips}, total_audio={n_clips}s, total_tokens={n_clips * 100}")
     print(f"  Device: {device}")
@@ -335,12 +326,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
     print(f"{'#'*60}")
 
     if use_wandb:
-        if dataset == "tedlium":
-            run_name = f"{dataset}_{target_seconds}s_{mode}"
-        elif n_clips > 1:
-            run_name = f"longseq_n{n_clips}_{mode}"
-        else:
-            run_name = f"{dataset}_{mode}"
+        run_name = f"longseq_n{n_clips}_{mode}" if n_clips > 1 else f"{dataset}_{mode}"
         try:
             wandb.init(
                 project=wandb_project,
@@ -349,7 +335,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                 config={
                     "dataset": dataset,
                     "mode": mode,
-                    "num_classes": len(_build_tedlium_index(data_root)[1]) if dataset == "tedlium" else cfg["num_classes"],
+                    "num_classes": cfg["num_classes"],
                     "n_clips": n_clips,
                     "n_pool_tokens": n_pool_tokens,
                     "epochs": epochs,
@@ -368,7 +354,6 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                     "grad_accum_steps": grad_accum_steps,
                     "save_every": save_every,
                     "resume": resume,
-                    "target_seconds": target_seconds if dataset == "tedlium" else None,
                 },
             )
         except Exception as e:
@@ -395,7 +380,6 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
             grad_accum_steps=grad_accum_steps,
             save_every=save_every,
             resume=resume,
-            target_seconds=target_seconds,
         )
         fold_accuracies.append(best_acc)
         all_histories[f"fold_{fold}"] = history
@@ -428,10 +412,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
         "lr": lr,
         "histories": all_histories,
     }
-    if dataset == "tedlium":
-        result_file = f"results/{dataset}_{target_seconds}s_{mode}_{timestamp}.json"
-        results["target_seconds"] = target_seconds
-    elif n_clips > 1:
+    if n_clips > 1:
         result_file = f"results/longseq_n{n_clips}_{mode}_{timestamp}.json"
     else:
         result_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
@@ -456,15 +437,13 @@ def main():
     parser.add_argument("--mode", type=str, default="raw",
                         choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
     parser.add_argument("--dataset", type=str, default="esc50",
-                        choices=["esc50", "urbansound8k", "speechcommands", "librispeech", "tedlium"])
+                        choices=["esc50", "urbansound8k", "speechcommands", "librispeech"])
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--n_clips", type=int, default=1,
                         help="Number of clips to concatenate (long-seq experiment)")
-    parser.add_argument("--target_seconds", type=int, default=30,
-                        help="Clip duration in seconds for TEDLIUM scaling experiment")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training (AMP)")
     parser.add_argument("--grad_accum", type=int, default=1,
@@ -493,7 +472,7 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if args.dataset not in ("speechcommands", "tedlium") and not os.path.exists(args.data_root):
+    if args.dataset not in ("speechcommands",) and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         if args.dataset == "urbansound8k":
             print("\nDownload UrbanSound8K from:")
@@ -504,11 +483,6 @@ def main():
             print("  https://www.openslr.org/12")
             print("\nDownload train-clean-100, extract so the structure is:")
             print("  data/LibriSpeech/train-clean-100/<speaker_id>/<chapter_id>/*.flac")
-        elif args.dataset == "tedlium":
-            print("\nDownload TEDLIUM Release 3 from:")
-            print("  https://www.openslr.org/51/")
-            print("\nExtract so the structure is:")
-            print("  data/TEDLIUM_release-3/data/{stm/,sph/}")
         else:
             print("\nTo download:")
             print("  git clone https://github.com/karolpiczak/ESC-50.git data/ESC-50-master")
@@ -540,7 +514,6 @@ def main():
             grad_accum_steps=args.grad_accum,
             save_every=args.save_every,
             resume=args.resume,
-            target_seconds=args.target_seconds,
         )
         results[mode] = {"mean": mean, "std": std}
 
