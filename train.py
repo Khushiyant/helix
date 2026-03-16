@@ -16,7 +16,7 @@ except ImportError:
     wandb = None
 
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders, get_librispeech_scaling_dataloaders
 
 N_LAYERS = 6
 
@@ -24,7 +24,7 @@ DATASET_CONFIG = {
     "esc50": {"num_classes": 50, "num_folds": 5, "default_root": "data/ESC-50-master"},
     "urbansound8k": {"num_classes": 10, "num_folds": 10, "default_root": "data/UrbanSound8K"},
     "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
-    "librispeech": {"num_classes": 251, "num_folds": 1, "default_root": "data/LibriSpeech"},
+    "librispeech": {"num_classes": 921, "num_folds": 1, "default_root": "data/LibriSpeech"},
 }
 
 
@@ -152,20 +152,25 @@ def _load_checkpoint(path, model, optimizer, scheduler, scaler, device):
     return ckpt["epoch"], ckpt["best_acc"], ckpt["history"]
 
 
-def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
+def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, use_amp=False, grad_accum_steps=1, save_every=0, resume=False, target_seconds=0):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
     num_classes = cfg["num_classes"]
 
     print(f"\n{'='*60}")
     print(f"  FOLD {fold}/{num_folds} — Mode: {mode} — Dataset: {dataset}" +
+          (f" — {target_seconds}s clips" if target_seconds > 0 else "") +
           (f" — n_clips: {n_clips}" if n_clips > 1 else "") +
           (" — AMP" if use_amp else "") +
           (f" — grad_accum: {grad_accum_steps}" if grad_accum_steps > 1 else ""))
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
-    if dataset == "speechcommands" and n_clips > 1:
+    if dataset == "librispeech" and target_seconds > 0:
+        train_loader, test_loader, num_classes = get_librispeech_scaling_dataloaders(
+            root=data_root, target_seconds=target_seconds, batch_size=batch_size,
+        )
+    elif dataset == "speechcommands" and n_clips > 1:
         train_loader, test_loader = get_concat_speechcommands_dataloaders(
             root=data_root, n_clips=n_clips, batch_size=batch_size,
         )
@@ -311,12 +316,14 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     return best_acc, history
 
 
-def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None, use_amp=False, grad_accum_steps=1, save_every=0, resume=False):
+def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_size=32, lr=3e-4, n_clips=1, n_pool_tokens=None, use_wandb=False, wandb_project=None, wandb_entity=None, use_amp=False, grad_accum_steps=1, save_every=0, resume=False, target_seconds=0):
     cfg = DATASET_CONFIG[dataset]
     num_folds = cfg["num_folds"]
 
     print(f"\n{'#'*60}")
     print(f"  EXPERIMENT: {mode.upper()} — Dataset: {dataset}")
+    if target_seconds > 0:
+        print(f"  Scaling: {target_seconds}s clips, speaker ID")
     if n_clips > 1:
         print(f"  Long-seq: n_clips={n_clips}, total_audio={n_clips}s, total_tokens={n_clips * 100}")
     print(f"  Device: {device}")
@@ -326,7 +333,12 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
     print(f"{'#'*60}")
 
     if use_wandb:
-        run_name = f"longseq_n{n_clips}_{mode}" if n_clips > 1 else f"{dataset}_{mode}"
+        if target_seconds > 0:
+            run_name = f"{dataset}_{target_seconds}s_{mode}"
+        elif n_clips > 1:
+            run_name = f"longseq_n{n_clips}_{mode}"
+        else:
+            run_name = f"{dataset}_{mode}"
         try:
             wandb.init(
                 project=wandb_project,
@@ -354,6 +366,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
                     "grad_accum_steps": grad_accum_steps,
                     "save_every": save_every,
                     "resume": resume,
+                    "target_seconds": target_seconds,
                 },
             )
         except Exception as e:
@@ -380,6 +393,7 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
             grad_accum_steps=grad_accum_steps,
             save_every=save_every,
             resume=resume,
+            target_seconds=target_seconds,
         )
         fold_accuracies.append(best_acc)
         all_histories[f"fold_{fold}"] = history
@@ -412,7 +426,10 @@ def run_experiment(mode, data_root, device, dataset="esc50", epochs=100, batch_s
         "lr": lr,
         "histories": all_histories,
     }
-    if n_clips > 1:
+    if target_seconds > 0:
+        result_file = f"results/{dataset}_{target_seconds}s_{mode}_{timestamp}.json"
+        results["target_seconds"] = target_seconds
+    elif n_clips > 1:
         result_file = f"results/longseq_n{n_clips}_{mode}_{timestamp}.json"
     else:
         result_prefix = f"{dataset}_{mode}" if dataset != "esc50" else mode
@@ -444,6 +461,8 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--n_clips", type=int, default=1,
                         help="Number of clips to concatenate (long-seq experiment)")
+    parser.add_argument("--target_seconds", type=int, default=0,
+                        help="Clip duration for scaling experiment (0=disabled, e.g. 30, 60, 300)")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training (AMP)")
     parser.add_argument("--grad_accum", type=int, default=1,
@@ -514,6 +533,7 @@ def main():
             grad_accum_steps=args.grad_accum,
             save_every=args.save_every,
             resume=args.resume,
+            target_seconds=args.target_seconds,
         )
         results[mode] = {"mean": mean, "std": std}
 

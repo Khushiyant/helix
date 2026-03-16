@@ -609,6 +609,208 @@ class LibriSpeechSpectrogram(Dataset):
         return mel, self.speaker_to_idx[speaker_id]
 
 
+def _download_librispeech_hf(root):
+    """Download LibriSpeech train-clean-100 via HuggingFace and export WAVs by speaker."""
+    index_path = os.path.join(root, "index.csv")
+    if os.path.exists(index_path):
+        return
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError(
+            "LibriSpeech auto-download requires the 'datasets' package.\n"
+            "  pip install datasets\n"
+            "Then re-run."
+        )
+
+    print("  Downloading LibriSpeech train-clean-100 from HuggingFace...")
+    ds = load_dataset("openslr/librispeech_asr", "clean", split="train.360")
+
+    wav_dir = os.path.join(root, "wav")
+    os.makedirs(wav_dir, exist_ok=True)
+
+    rows = []
+    print(f"  Exporting {len(ds)} utterances...")
+    for i, row in enumerate(ds):
+        speaker_id = str(row["speaker_id"])
+        audio = row["audio"]
+        sr = audio["sampling_rate"]
+        samples = np.array(audio["array"], dtype=np.float32)
+        duration = len(samples) / sr
+
+        if duration < 0.5:
+            continue
+
+        speaker_dir = os.path.join(wav_dir, speaker_id)
+        os.makedirs(speaker_dir, exist_ok=True)
+        wav_path = os.path.join(speaker_dir, f"{i:06d}.wav")
+        sf.write(wav_path, samples, sr)
+        rows.append(f"{speaker_id},{wav_path},{duration:.3f}")
+
+        if (i + 1) % 5000 == 0:
+            print(f"    {i + 1}/{len(ds)} exported...")
+
+    with open(index_path, "w") as f:
+        f.write("speaker_id,path,duration\n")
+        f.write("\n".join(rows) + "\n")
+
+    n_speakers = len(set(r.split(",")[0] for r in rows))
+    print(f"  LibriSpeech ready: {len(rows)} utterances, {n_speakers} speakers")
+
+
+def _build_librispeech_speaker_index(root):
+    """Build per-speaker segment index from LibriSpeech, auto-downloading if needed."""
+    index_path = os.path.join(root, "index.csv")
+
+    if not os.path.exists(index_path):
+        # Check for local FLAC files first (manual download)
+        subset_dir = os.path.join(root, "train-clean-100")
+        if os.path.isdir(subset_dir):
+            files, speaker_to_idx = _discover_librispeech_files(root, "train-clean-100")
+            speaker_segments = {}
+            for path, speaker_id in files:
+                try:
+                    info = sf.info(path)
+                    duration = info.duration
+                except Exception:
+                    continue
+                speaker_segments.setdefault(speaker_id, []).append((path, duration))
+            return speaker_segments, speaker_to_idx
+        else:
+            _download_librispeech_hf(root)
+
+    meta = pd.read_csv(index_path)
+    speaker_segments = {}
+    for _, row in meta.iterrows():
+        speaker_id = str(row["speaker_id"])
+        speaker_segments.setdefault(speaker_id, []).append(
+            (row["path"], row["duration"])
+        )
+
+    speakers = sorted(speaker_segments.keys())
+    speaker_to_idx = {s: i for i, s in enumerate(speakers)}
+    return speaker_segments, speaker_to_idx
+
+
+def _split_speakers_by_utterance(speaker_segments, val_ratio=0.2, seed=42):
+    """Hold out utterances per speaker so every speaker is seen during training."""
+    rng = np.random.RandomState(seed)
+    train_segs = {}
+    val_segs = {}
+    for speaker_id in sorted(speaker_segments.keys()):
+        utterances = list(speaker_segments[speaker_id])
+        rng.shuffle(utterances)
+        n_val = max(1, int(len(utterances) * val_ratio))
+        val_segs[speaker_id] = utterances[:n_val]
+        train_segs[speaker_id] = utterances[n_val:]
+    return train_segs, val_segs
+
+
+class LibriSpeechScalingRaw(Dataset):
+    """Stitches utterances from the same speaker to create long clips
+    for scaling experiments (30s, 60s, 300s)."""
+
+    def __init__(self, speaker_segments, speaker_to_idx, target_seconds=30, augment=False):
+        self.speaker_to_idx = speaker_to_idx
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = int(target_seconds * self.target_sr)
+
+        self.samples = []
+        for speaker_id in sorted(speaker_segments.keys()):
+            segs = speaker_segments[speaker_id]
+            total_dur = sum(dur for _, dur in segs)
+            n_samples = max(1, int(total_dur / target_seconds))
+            for i in range(n_samples):
+                self.samples.append((speaker_id, i, n_samples))
+
+        self.speaker_segments = speaker_segments
+        n_speakers = len(speaker_segments)
+        print(f"  Loaded {len(self.samples)} samples ({n_speakers} speakers, {target_seconds}s clips)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_wav(self, path):
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception:
+            return torch.zeros(1, self.target_sr)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+        return waveform
+
+    def _augment(self, waveform):
+        shift = np.random.randint(-self.target_sr, self.target_sr)
+        waveform = torch.roll(waveform, shift, dims=-1)
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+        return waveform
+
+    def __getitem__(self, idx):
+        speaker_id, sample_idx, n_speaker_samples = self.samples[idx]
+        segs = self.speaker_segments[speaker_id]
+
+        rng = np.random.RandomState(idx) if not self.augment else np.random
+        order = list(range(len(segs)))
+        rng.shuffle(order)
+        start_seg = (sample_idx * len(segs) // n_speaker_samples) % len(segs)
+        order = order[start_seg:] + order[:start_seg]
+
+        parts = []
+        collected = 0
+        for seg_idx in order:
+            if collected >= self.target_length:
+                break
+            path, _dur = segs[seg_idx]
+            chunk = self._load_wav(path)
+            parts.append(chunk)
+            collected += chunk.shape[1]
+
+        waveform = torch.cat(parts, dim=-1) if parts else torch.zeros(1, self.target_length)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, self.speaker_to_idx[speaker_id]
+
+
+def get_librispeech_scaling_dataloaders(root, target_seconds=30, batch_size=32):
+    print(f"\nCreating LibriSpeech scaling dataloaders ({target_seconds}s clips, speaker ID)")
+    speaker_segments, speaker_to_idx = _build_librispeech_speaker_index(root)
+    train_segs, val_segs = _split_speakers_by_utterance(speaker_segments)
+
+    train_dataset = LibriSpeechScalingRaw(
+        train_segs, speaker_to_idx, target_seconds=target_seconds, augment=True,
+    )
+    test_dataset = LibriSpeechScalingRaw(
+        val_segs, speaker_to_idx, target_seconds=target_seconds, augment=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True,
+    )
+
+    return train_loader, test_loader, len(speaker_to_idx)
+
+
 def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  # noqa: ARG001
     DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
 
