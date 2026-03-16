@@ -624,8 +624,13 @@ def _download_librispeech_hf(root):
             "Then re-run."
         )
 
+    import io
+    from datasets import Audio
+
     print("  Downloading LibriSpeech train-clean-100 from HuggingFace...")
     ds = load_dataset("openslr/librispeech_asr", "clean", split="train.360")
+    # Disable automatic audio decoding (avoids torchcodec/FFmpeg dependency)
+    ds = ds.cast_column("audio", Audio(decode=False))
 
     wav_dir = os.path.join(root, "wav")
     os.makedirs(wav_dir, exist_ok=True)
@@ -634,9 +639,8 @@ def _download_librispeech_hf(root):
     print(f"  Exporting {len(ds)} utterances...")
     for i, row in enumerate(ds):
         speaker_id = str(row["speaker_id"])
-        audio = row["audio"]
-        sr = audio["sampling_rate"]
-        samples = np.array(audio["array"], dtype=np.float32)
+        audio_bytes = row["audio"]["bytes"]
+        samples, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
         duration = len(samples) / sr
 
         if duration < 0.5:
