@@ -16,3 +16,4 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.18.0"]
+tedlium = ["datasets>=2.14.0"]

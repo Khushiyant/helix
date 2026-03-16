@@ -636,94 +636,74 @@ def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  
     return train_loader, test_loader
 
 
-def _parse_tedlium_stm(stm_path):
-    """Parse a single STM file into a list of (start, end, speaker_id) segments."""
-    segments = []
-    with open(stm_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith(";;"):
-                continue
-            parts = line.split()
-            if len(parts) < 6:
-                continue
-            speaker_id = parts[2]
-            if speaker_id == "inter_segment_gap":
-                continue
-            start = float(parts[3])
-            end = float(parts[4])
-            if end - start < 0.5:
-                continue
-            segments.append((start, end, speaker_id))
-    return segments
-
-
-_TEDLIUM_URL = "http://www.openslr.org/resources/51/TEDLIUM_release-3.tgz"
-
 
 def _download_tedlium(root):
-    """Download and extract TEDLIUM release 3 if not already present."""
-    import subprocess
-    import tarfile
+    """Download TEDLIUM release 3 via HuggingFace datasets and export segments as WAV files.
 
-    data_dir = os.path.join(root, "data", "stm")
-    if os.path.isdir(data_dir) and os.listdir(data_dir):
+    HF serves pre-segmented audio (one clip per segment, not full talks).
+    We save each segment as a WAV file grouped by speaker, and build an index CSV.
+    """
+    index_path = os.path.join(root, "index.csv")
+    if os.path.exists(index_path):
         return
 
-    parent = os.path.dirname(root)
-    os.makedirs(parent, exist_ok=True)
-    tar_path = os.path.join(parent, "TEDLIUM_release-3.tgz")
-
-    if not os.path.exists(tar_path):
-        print(f"  Downloading TEDLIUM release 3 (~50GB)...")
-        ret = subprocess.run(
-            ["curl", "-L", "-o", tar_path, "--progress-bar", _TEDLIUM_URL],
-            check=False,
-        )
-        if ret.returncode != 0:
-            if os.path.exists(tar_path):
-                os.remove(tar_path)
-            raise RuntimeError(
-                f"Download failed (curl exit {ret.returncode}). "
-                f"Download manually:\n  curl -L -o {tar_path} {_TEDLIUM_URL}"
-            )
-
-    # Validate it's actually gzip before extracting
-    with open(tar_path, "rb") as f:
-        magic = f.read(2)
-    if magic != b'\x1f\x8b':
-        os.remove(tar_path)
+    try:
+        from datasets import load_dataset
+    except ImportError:
         raise RuntimeError(
-            f"Downloaded file is not a valid gzip archive (got {magic!r}). "
-            f"Download manually:\n  curl -L -o {tar_path} {_TEDLIUM_URL}"
+            "TEDLIUM auto-download requires the 'datasets' package.\n"
+            "  pip install datasets\n"
+            "Then re-run."
         )
 
-    print(f"  Extracting to {root}...")
-    with tarfile.open(tar_path, "r:gz") as tar:
-        tar.extractall(parent)
+    print("  Downloading TEDLIUM release 3 from HuggingFace...")
+    ds = load_dataset("LIUM/tedlium", "release3", split="train", trust_remote_code=True)
 
-    os.remove(tar_path)
-    print(f"  TEDLIUM ready at {root}")
+    wav_dir = os.path.join(root, "wav")
+    os.makedirs(wav_dir, exist_ok=True)
+
+    rows = []
+    print(f"  Exporting {len(ds)} segments...")
+    for i, row in enumerate(ds):
+        speaker_id = row["speaker_id"]
+        audio = row["audio"]
+        sr = audio["sampling_rate"]
+        samples = np.array(audio["array"], dtype=np.float32)
+        duration = len(samples) / sr
+
+        if duration < 0.5:
+            continue
+
+        speaker_dir = os.path.join(wav_dir, speaker_id)
+        os.makedirs(speaker_dir, exist_ok=True)
+        wav_path = os.path.join(speaker_dir, f"{i:06d}.wav")
+        sf.write(wav_path, samples, sr)
+
+        rows.append(f"{speaker_id},{wav_path},{duration:.3f}")
+
+        if (i + 1) % 5000 == 0:
+            print(f"    {i + 1}/{len(ds)} segments exported...")
+
+    with open(index_path, "w") as f:
+        f.write("speaker_id,path,duration\n")
+        f.write("\n".join(rows) + "\n")
+
+    n_speakers = len(set(r.split(",")[0] for r in rows))
+    print(f"  TEDLIUM ready: {len(rows)} segments, {n_speakers} speakers")
 
 
-def _build_tedlium_index(root, subset="data"):
-    """Build index of (sph_path, segments) for a TEDLium subset."""
+def _build_tedlium_index(root):
+    """Build speaker segment index from TEDLIUM CSV index."""
     _download_tedlium(root)
-    stm_dir = os.path.join(root, subset, "stm")
-    sph_dir = os.path.join(root, subset, "sph")
-    if not os.path.isdir(stm_dir):
-        raise FileNotFoundError(f"TEDLium STM dir not found: {stm_dir}")
+    index_path = os.path.join(root, "index.csv")
+    meta = pd.read_csv(index_path)
 
     speaker_segments = {}
-    for stm_file in sorted(os.listdir(stm_dir)):
-        if not stm_file.endswith(".stm"):
-            continue
-        talk_id = stm_file.replace(".stm", "")
-        sph_path = os.path.join(sph_dir, f"{talk_id}.sph")
-        if not os.path.exists(sph_path):
-            continue
-        for start, end, speaker_id in _parse_tedlium_stm(os.path.join(stm_dir, stm_file)):
-            speaker_segments.setdefault(speaker_id, []).append((sph_path, start, end))
+    for _, row in meta.iterrows():
+        speaker_id = row["speaker_id"]
+        speaker_segments.setdefault(speaker_id, []).append(
+            (row["path"], row["duration"])
+        )
 
     speakers = sorted(speaker_segments.keys())
     speaker_to_idx = {s: i for i, s in enumerate(speakers)}
@@ -758,7 +738,7 @@ class TEDLIUMRaw(Dataset):
         self.samples = []
         for speaker_id in sorted(speaker_segments.keys()):
             segs = speaker_segments[speaker_id]
-            total_dur = sum(end - start for _, start, end in segs)
+            total_dur = sum(dur for _, dur in segs)
             n_samples = max(1, int(total_dur / target_seconds))
             for i in range(n_samples):
                 self.samples.append((speaker_id, i, n_samples))
@@ -770,14 +750,11 @@ class TEDLIUMRaw(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_segment(self, sph_path, start, end):
-        frame_start = int(start * self.target_sr)
-        num_frames = int((end - start) * self.target_sr)
+    def _load_wav(self, wav_path):
         try:
-            data, sr = sf.read(sph_path, start=frame_start, frames=num_frames,
-                               dtype="float32", always_2d=True)
+            data, sr = sf.read(wav_path, dtype="float32", always_2d=True)
         except Exception:
-            return torch.zeros(1, num_frames)
+            return torch.zeros(1, self.target_sr)
         waveform = torch.from_numpy(data.T)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
@@ -809,8 +786,8 @@ class TEDLIUMRaw(Dataset):
         for seg_idx in order:
             if collected >= self.target_length:
                 break
-            sph_path, start, end = segs[seg_idx]
-            chunk = self._load_segment(sph_path, start, end)
+            wav_path, _duration = segs[seg_idx]
+            chunk = self._load_wav(wav_path)
             parts.append(chunk)
             collected += chunk.shape[1]
 
@@ -845,7 +822,7 @@ class TEDLIUMSpectrogram(Dataset):
         self.samples = []
         for speaker_id in sorted(speaker_segments.keys()):
             segs = speaker_segments[speaker_id]
-            total_dur = sum(end - start for _, start, end in segs)
+            total_dur = sum(dur for _, dur in segs)
             n_samples = max(1, int(total_dur / target_seconds))
             for i in range(n_samples):
                 self.samples.append((speaker_id, i, n_samples))
@@ -857,14 +834,11 @@ class TEDLIUMSpectrogram(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_segment(self, sph_path, start, end):
-        frame_start = int(start * self.target_sr)
-        num_frames = int((end - start) * self.target_sr)
+    def _load_wav(self, wav_path):
         try:
-            data, sr = sf.read(sph_path, start=frame_start, frames=num_frames,
-                               dtype="float32", always_2d=True)
+            data, sr = sf.read(wav_path, dtype="float32", always_2d=True)
         except Exception:
-            return torch.zeros(1, num_frames)
+            return torch.zeros(1, self.target_sr)
         waveform = torch.from_numpy(data.T)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
@@ -887,8 +861,8 @@ class TEDLIUMSpectrogram(Dataset):
         for seg_idx in order:
             if collected >= self.target_length:
                 break
-            sph_path, start, end = segs[seg_idx]
-            chunk = self._load_segment(sph_path, start, end)
+            wav_path, _duration = segs[seg_idx]
+            chunk = self._load_wav(wav_path)
             parts.append(chunk)
             collected += chunk.shape[1]
 
