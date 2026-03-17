@@ -900,31 +900,32 @@ def _build_voxpopuli_speaker_index(root):
 
 
 class VoxPopuliScalingRaw(Dataset):
-    """Uses naturally long VoxPopuli segments for scaling experiments."""
+    """Stitches same-speaker VoxPopuli segments to create long clips for scaling experiments.
+
+    VoxPopuli segments are naturally longer than LibriSpeech (tens of seconds vs 5-15s),
+    so fewer stitches are needed, producing more natural-sounding clips.
+    """
 
     def __init__(self, speaker_segments, speaker_to_idx, target_seconds=30, augment=False):
         self.speaker_to_idx = speaker_to_idx
         self.augment = augment
         self.target_sr = 16000
         self.target_length = int(target_seconds * self.target_sr)
+        self.speaker_segments = speaker_segments
 
         self.samples = []
-        total_segs = 0
         for speaker_id in sorted(speaker_segments.keys()):
-            for path, duration in speaker_segments[speaker_id]:
-                total_segs += 1
-                if duration >= target_seconds:
-                    self.samples.append((speaker_id, path, duration))
+            segs = speaker_segments[speaker_id]
+            total_dur = sum(dur for _, dur in segs)
+            n_samples = max(1, int(total_dur / target_seconds))
+            for i in range(n_samples):
+                self.samples.append((speaker_id, i, n_samples))
 
-        if len(self.samples) == 0:
-            raise ValueError(
-                f"No segments >= {target_seconds}s found ({total_segs} total inspected). "
-                f"Use a shorter --target_seconds value."
-            )
-
-        n_speakers = len(set(s for s, _, _ in self.samples))
-        print(f"  {len(self.samples)}/{total_segs} segments >= {target_seconds}s "
-              f"({n_speakers} speakers)")
+        n_speakers = len(speaker_segments)
+        avg_dur = np.mean([d for segs in speaker_segments.values() for _, d in segs])
+        avg_stitches = max(1, target_seconds / avg_dur)
+        print(f"  {len(self.samples)} samples ({n_speakers} speakers, {target_seconds}s clips, "
+              f"~{avg_stitches:.1f} segments/clip avg)")
 
     def __len__(self):
         return len(self.samples)
@@ -934,7 +935,7 @@ class VoxPopuliScalingRaw(Dataset):
             data, sr = sf.read(path, dtype="float32", always_2d=True)
         except Exception as e:
             print(f"  WARNING: failed to read {path} ({type(e).__name__}): {e}")
-            return torch.zeros(1, self.target_length)
+            return torch.zeros(1, self.target_sr)
         waveform = torch.from_numpy(data.T)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
@@ -950,20 +951,32 @@ class VoxPopuliScalingRaw(Dataset):
         return waveform
 
     def __getitem__(self, idx):
-        speaker_id, path, duration = self.samples[idx]
-        waveform = self._load_wav(path)
-        total_samples = waveform.shape[1]
+        speaker_id, sample_idx, n_speaker_samples = self.samples[idx]
+        segs = self.speaker_segments[speaker_id]
 
-        if total_samples > self.target_length:
-            if self.augment:
-                max_start = total_samples - self.target_length
-                start = np.random.randint(0, max_start)
-            else:
-                start = 0
-            waveform = waveform[:, start:start + self.target_length]
-        elif total_samples < self.target_length:
-            pad = self.target_length - total_samples
+        rng = np.random.RandomState(idx) if not self.augment else np.random
+        order = list(range(len(segs)))
+        rng.shuffle(order)
+        start_seg = (sample_idx * len(segs) // n_speaker_samples) % len(segs)
+        order = order[start_seg:] + order[:start_seg]
+
+        parts = []
+        collected = 0
+        for seg_idx in order:
+            if collected >= self.target_length:
+                break
+            path, _dur = segs[seg_idx]
+            chunk = self._load_wav(path)
+            parts.append(chunk)
+            collected += chunk.shape[1]
+
+        waveform = torch.cat(parts, dim=-1) if parts else torch.zeros(1, self.target_length)
+
+        if waveform.shape[1] < self.target_length:
+            pad = self.target_length - waveform.shape[1]
             waveform = torch.nn.functional.pad(waveform, (0, pad))
+        else:
+            waveform = waveform[:, :self.target_length]
 
         if self.augment:
             waveform = self._augment(waveform)
@@ -981,13 +994,6 @@ def get_voxpopuli_scaling_dataloaders(root, target_seconds=30, batch_size=32):
     test_dataset = VoxPopuliScalingRaw(
         val_segs, speaker_to_idx, target_seconds=target_seconds, augment=False,
     )
-
-    train_speakers = set(s for s, _, _ in train_dataset.samples)
-    val_speakers = set(s for s, _, _ in test_dataset.samples)
-    missing = train_speakers - val_speakers
-    if missing:
-        print(f"  WARNING: {len(missing)} speakers in train have no val segments >= {target_seconds}s. "
-              f"Val covers {len(val_speakers)}/{len(train_speakers)} speakers.")
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
