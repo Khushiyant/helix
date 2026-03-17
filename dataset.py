@@ -815,6 +815,192 @@ def get_librispeech_scaling_dataloaders(root, target_seconds=30, batch_size=32):
     return train_loader, test_loader, len(speaker_to_idx)
 
 
+def _download_voxpopuli_hf(root):
+    """Download VoxPopuli English via HuggingFace and export WAVs by speaker."""
+    index_train = os.path.join(root, "index_train.csv")
+    index_val = os.path.join(root, "index_validation.csv")
+    if os.path.exists(index_train) and os.path.exists(index_val):
+        return
+
+    try:
+        from datasets import load_dataset, Audio
+    except ImportError:
+        raise RuntimeError(
+            "VoxPopuli auto-download requires the 'datasets' package.\n"
+            "  pip install datasets\n"
+            "Then re-run."
+        )
+
+    import io
+
+    wav_dir = os.path.join(root, "wav")
+    os.makedirs(wav_dir, exist_ok=True)
+
+    for split_name, index_path in [("train", index_train), ("validation", index_val)]:
+        if os.path.exists(index_path):
+            continue
+
+        print(f"  Downloading VoxPopuli English ({split_name}) from HuggingFace...")
+        ds = load_dataset("facebook/voxpopuli", "en", split=split_name)
+        ds = ds.cast_column("audio", Audio(decode=False))
+
+        rows = []
+        print(f"  Exporting {len(ds)} utterances ({split_name})...")
+        for i, row in enumerate(ds):
+            speaker_id = str(row["speaker_id"])
+            audio_bytes = row["audio"]["bytes"]
+            if audio_bytes is None:
+                continue
+            try:
+                samples, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            except Exception:
+                continue
+            duration = len(samples) / sr
+
+            if duration < 1.0:
+                continue
+
+            speaker_dir = os.path.join(wav_dir, speaker_id)
+            os.makedirs(speaker_dir, exist_ok=True)
+            wav_path = os.path.join(speaker_dir, f"{split_name}_{i:06d}.wav")
+            sf.write(wav_path, samples, sr)
+            rows.append(f"{speaker_id},{wav_path},{duration:.3f}")
+
+            if (i + 1) % 5000 == 0:
+                print(f"    {i + 1}/{len(ds)} exported...")
+
+        with open(index_path, "w") as f:
+            f.write("speaker_id,path,duration\n")
+            f.write("\n".join(rows) + "\n")
+
+        n_speakers = len(set(r.split(",")[0] for r in rows))
+        print(f"  VoxPopuli {split_name} ready: {len(rows)} utterances, {n_speakers} speakers")
+
+
+def _build_voxpopuli_speaker_index(root):
+    """Build per-speaker segment index from VoxPopuli, auto-downloading if needed."""
+    _download_voxpopuli_hf(root)
+
+    train_segs = {}
+    val_segs = {}
+    all_speakers = set()
+
+    for split_name, segs_dict in [("train", train_segs), ("validation", val_segs)]:
+        index_path = os.path.join(root, f"index_{split_name}.csv")
+        meta = pd.read_csv(index_path)
+        for _, row in meta.iterrows():
+            speaker_id = str(row["speaker_id"])
+            segs_dict.setdefault(speaker_id, []).append(
+                (row["path"], row["duration"])
+            )
+            all_speakers.add(speaker_id)
+
+    speaker_to_idx = {s: i for i, s in enumerate(sorted(all_speakers))}
+    return train_segs, val_segs, speaker_to_idx
+
+
+class VoxPopuliScalingRaw(Dataset):
+    """Uses naturally long VoxPopuli segments for scaling experiments."""
+
+    def __init__(self, speaker_segments, speaker_to_idx, target_seconds=30, augment=False):
+        self.speaker_to_idx = speaker_to_idx
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = int(target_seconds * self.target_sr)
+
+        self.samples = []
+        total_segs = 0
+        for speaker_id in sorted(speaker_segments.keys()):
+            for path, duration in speaker_segments[speaker_id]:
+                total_segs += 1
+                if duration >= target_seconds:
+                    self.samples.append((speaker_id, path, duration))
+
+        if len(self.samples) == 0:
+            raise ValueError(
+                f"No segments >= {target_seconds}s found ({total_segs} total inspected). "
+                f"Use a shorter --target_seconds value."
+            )
+
+        n_speakers = len(set(s for s, _, _ in self.samples))
+        print(f"  {len(self.samples)}/{total_segs} segments >= {target_seconds}s "
+              f"({n_speakers} speakers)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_wav(self, path):
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception as e:
+            print(f"  WARNING: failed to read {path} ({type(e).__name__}): {e}")
+            return torch.zeros(1, self.target_length)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+        return waveform
+
+    def _augment(self, waveform):
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+        return waveform
+
+    def __getitem__(self, idx):
+        speaker_id, path, duration = self.samples[idx]
+        waveform = self._load_wav(path)
+        total_samples = waveform.shape[1]
+
+        if total_samples > self.target_length:
+            if self.augment:
+                max_start = total_samples - self.target_length
+                start = np.random.randint(0, max_start)
+            else:
+                start = 0
+            waveform = waveform[:, start:start + self.target_length]
+        elif total_samples < self.target_length:
+            pad = self.target_length - total_samples
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, self.speaker_to_idx[speaker_id]
+
+
+def get_voxpopuli_scaling_dataloaders(root, target_seconds=30, batch_size=32):
+    print(f"\nCreating VoxPopuli scaling dataloaders ({target_seconds}s clips, speaker ID)")
+    train_segs, val_segs, speaker_to_idx = _build_voxpopuli_speaker_index(root)
+
+    train_dataset = VoxPopuliScalingRaw(
+        train_segs, speaker_to_idx, target_seconds=target_seconds, augment=True,
+    )
+    test_dataset = VoxPopuliScalingRaw(
+        val_segs, speaker_to_idx, target_seconds=target_seconds, augment=False,
+    )
+
+    train_speakers = set(s for s, _, _ in train_dataset.samples)
+    val_speakers = set(s for s, _, _ in test_dataset.samples)
+    missing = train_speakers - val_speakers
+    if missing:
+        print(f"  WARNING: {len(missing)} speakers in train have no val segments >= {target_seconds}s. "
+              f"Val covers {len(val_speakers)}/{len(train_speakers)} speakers.")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True,
+    )
+
+    return train_loader, test_loader, len(speaker_to_idx)
+
+
 def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  # noqa: ARG001
     DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
 
