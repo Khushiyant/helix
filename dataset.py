@@ -1026,7 +1026,7 @@ def _download_tedlium_hf(root):
     os.makedirs(wav_dir, exist_ok=True)
 
     print("  Downloading TEDLIUM 3 from HuggingFace...")
-    ds = load_dataset("LIUM/tedlium", "release3", split="train")
+    ds = load_dataset("distil-whisper/tedlium", "release3", split="train")
 
     # Pass 1: group segment indices by talk file (no audio decoding)
     print(f"  Scanning {len(ds)} segments into talks...")
