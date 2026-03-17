@@ -16,7 +16,7 @@ except ImportError:
     wandb = None
 
 from model import RawWaveformMamba, SpectrogramMamba
-from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders, get_librispeech_scaling_dataloaders, get_voxpopuli_scaling_dataloaders
+from dataset import get_dataloaders, get_speechcommands_dataloaders, get_concat_speechcommands_dataloaders, get_urbansound8k_dataloaders, get_librispeech_dataloaders, get_librispeech_scaling_dataloaders, get_voxpopuli_scaling_dataloaders, get_tedlium_scaling_dataloaders
 
 N_LAYERS = 6
 
@@ -26,6 +26,7 @@ DATASET_CONFIG = {
     "speechcommands": {"num_classes": 35, "num_folds": 1, "default_root": "data"},
     "librispeech": {"num_classes": 921, "num_folds": 1, "default_root": "data/LibriSpeech"},
     "voxpopuli": {"num_classes": 1313, "num_folds": 1, "default_root": "data/VoxPopuli"},
+    "tedlium": {"num_classes": 2028, "num_folds": 1, "default_root": "data/TEDLIUM"},
 }
 
 
@@ -167,7 +168,12 @@ def train_fold(fold, mode, data_root, device, dataset="esc50", epochs=100, batch
     print(f"{'='*60}")
 
     data_mode = mode.replace("helix-", "").replace("attention-", "")
-    if dataset == "voxpopuli":
+    if dataset == "tedlium":
+        clip_seconds = target_seconds if target_seconds > 0 else 300
+        train_loader, test_loader, num_classes = get_tedlium_scaling_dataloaders(
+            root=data_root, target_seconds=clip_seconds, batch_size=batch_size,
+        )
+    elif dataset == "voxpopuli":
         clip_seconds = target_seconds if target_seconds > 0 else 30
         train_loader, test_loader, num_classes = get_voxpopuli_scaling_dataloaders(
             root=data_root, target_seconds=clip_seconds, batch_size=batch_size,
@@ -460,7 +466,7 @@ def main():
     parser.add_argument("--mode", type=str, default="raw",
                         choices=["raw", "spectrogram", "helix-raw", "helix-spectrogram", "attention-raw", "attention-spectrogram", "both"])
     parser.add_argument("--dataset", type=str, default="esc50",
-                        choices=["esc50", "urbansound8k", "speechcommands", "librispeech", "voxpopuli"])
+                        choices=["esc50", "urbansound8k", "speechcommands", "librispeech", "voxpopuli", "tedlium"])
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -497,7 +503,7 @@ def main():
         device = torch.device("cpu")
         print("WARNING: Running on CPU — this will be slow!")
 
-    if args.dataset not in ("speechcommands", "librispeech", "voxpopuli") and not os.path.exists(args.data_root):
+    if args.dataset not in ("speechcommands", "librispeech", "voxpopuli", "tedlium") and not os.path.exists(args.data_root):
         print(f"\nERROR: {args.dataset} not found at '{args.data_root}'")
         if args.dataset == "urbansound8k":
             print("\nDownload UrbanSound8K from:")

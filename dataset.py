@@ -1007,6 +1007,210 @@ def get_voxpopuli_scaling_dataloaders(root, target_seconds=30, batch_size=32):
     return train_loader, test_loader, len(speaker_to_idx)
 
 
+def _download_tedlium_hf(root):
+    """Download TEDLIUM 3 via HuggingFace, reconstruct full talks, export as WAVs."""
+    index_path = os.path.join(root, "index.csv")
+    if os.path.exists(index_path):
+        return
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError(
+            "TEDLIUM auto-download requires the 'datasets' package.\n"
+            "  pip install datasets\n"
+            "Then re-run."
+        )
+
+    wav_dir = os.path.join(root, "wav")
+    os.makedirs(wav_dir, exist_ok=True)
+
+    print("  Downloading TEDLIUM 3 from HuggingFace...")
+    ds = load_dataset("LIUM/tedlium", "release3", split="train")
+
+    # Pass 1: group segment indices by talk file (no audio decoding)
+    print(f"  Scanning {len(ds)} segments into talks...")
+    ds_meta = ds.remove_columns(["audio"])
+    talks = {}
+    for i in range(len(ds_meta)):
+        row = ds_meta[i]
+        file_id = row.get("file", row["speaker_id"])
+        speaker_id = str(row["speaker_id"])
+        talks.setdefault(file_id, {"speaker_id": speaker_id, "indices": []})
+        talks[file_id]["indices"].append(i)
+
+    # Pass 2: reconstruct each talk by concatenating segments
+    print(f"  Reconstructing {len(talks)} talks as WAVs...")
+    rows = []
+    for talk_idx, (file_id, info) in enumerate(sorted(talks.items())):
+        speaker_id = info["speaker_id"]
+        parts = []
+        sr = 16000
+        for seg_idx in info["indices"]:
+            audio = ds[seg_idx]["audio"]
+            parts.append(np.array(audio["array"], dtype=np.float32))
+            sr = audio["sampling_rate"]
+
+        if not parts:
+            continue
+
+        full_audio = np.concatenate(parts)
+        duration = len(full_audio) / sr
+
+        if duration < 30.0:
+            continue
+
+        speaker_dir = os.path.join(wav_dir, speaker_id)
+        os.makedirs(speaker_dir, exist_ok=True)
+        safe_id = os.path.basename(file_id).replace(".sph", "").replace(" ", "_")
+        wav_path = os.path.join(speaker_dir, f"{safe_id}.wav")
+        sf.write(wav_path, full_audio, sr)
+        rows.append(f"{speaker_id},{wav_path},{duration:.3f}")
+
+        if (talk_idx + 1) % 100 == 0:
+            print(f"    {talk_idx + 1}/{len(talks)} talks exported...")
+
+    with open(index_path, "w") as f:
+        f.write("speaker_id,path,duration\n")
+        f.write("\n".join(rows) + "\n")
+
+    n_speakers = len(set(r.split(",")[0] for r in rows))
+    avg_dur = sum(float(r.rsplit(",", 1)[1]) for r in rows) / max(1, len(rows))
+    print(f"  TEDLIUM ready: {len(rows)} talks, {n_speakers} speakers, "
+          f"avg {avg_dur:.0f}s/talk")
+
+
+def _build_tedlium_speaker_index(root):
+    """Build per-speaker talk index, auto-downloading if needed."""
+    _download_tedlium_hf(root)
+    meta = pd.read_csv(os.path.join(root, "index.csv"))
+    speaker_talks = {}
+    for _, row in meta.iterrows():
+        speaker_id = str(row["speaker_id"])
+        speaker_talks.setdefault(speaker_id, []).append(
+            (row["path"], row["duration"])
+        )
+    speakers = sorted(speaker_talks.keys())
+    speaker_to_idx = {s: i for i, s in enumerate(speakers)}
+    return speaker_talks, speaker_to_idx
+
+
+def _split_tedlium_by_talk(speaker_talks, val_ratio=0.2, seed=42):
+    """Hold out talks per speaker for validation.
+    Speakers with only one talk go to train only."""
+    rng = np.random.RandomState(seed)
+    train = {}
+    val = {}
+    for speaker_id in sorted(speaker_talks.keys()):
+        talks = list(speaker_talks[speaker_id])
+        if len(talks) <= 1:
+            train[speaker_id] = talks
+        else:
+            rng.shuffle(talks)
+            n_val = max(1, int(len(talks) * val_ratio))
+            val[speaker_id] = talks[:n_val]
+            train[speaker_id] = talks[n_val:]
+    return train, val
+
+
+class TedliumScalingRaw(Dataset):
+    """Extracts windows from full TEDLIUM talks for scaling experiments.
+    Talks are naturally 10-20 minutes — no stitching needed."""
+
+    def __init__(self, speaker_talks, speaker_to_idx, target_seconds=30, augment=False):
+        self.speaker_to_idx = speaker_to_idx
+        self.augment = augment
+        self.target_sr = 16000
+        self.target_length = int(target_seconds * self.target_sr)
+
+        self.samples = []
+        total = 0
+        for speaker_id in sorted(speaker_talks.keys()):
+            for path, duration in speaker_talks[speaker_id]:
+                total += 1
+                if duration >= target_seconds:
+                    self.samples.append((speaker_id, path, duration))
+
+        if not self.samples:
+            raise ValueError(
+                f"No talks >= {target_seconds}s found ({total} total). "
+                f"Use a shorter --target_seconds."
+            )
+
+        n_speakers = len(set(s for s, _, _ in self.samples))
+        print(f"  {len(self.samples)}/{total} talks >= {target_seconds}s ({n_speakers} speakers)")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_wav(self, path):
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception as e:
+            print(f"  WARNING: failed to read {path} ({type(e).__name__}): {e}")
+            return torch.zeros(1, self.target_length)
+        waveform = torch.from_numpy(data.T)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.target_sr:
+            waveform = T.Resample(sr, self.target_sr)(waveform)
+        return waveform
+
+    def _augment(self, waveform):
+        scale = np.random.uniform(0.8, 1.2)
+        waveform = waveform * scale
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
+        return waveform
+
+    def __getitem__(self, idx):
+        speaker_id, path, duration = self.samples[idx]
+        waveform = self._load_wav(path)
+        total = waveform.shape[1]
+
+        if total > self.target_length:
+            if self.augment:
+                start = np.random.randint(0, total - self.target_length)
+            else:
+                start = 0
+            waveform = waveform[:, start:start + self.target_length]
+        elif total < self.target_length:
+            pad = self.target_length - total
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+
+        if self.augment:
+            waveform = self._augment(waveform)
+
+        return waveform, self.speaker_to_idx[speaker_id]
+
+
+def get_tedlium_scaling_dataloaders(root, target_seconds=30, batch_size=32):
+    print(f"\nCreating TEDLIUM scaling dataloaders ({target_seconds}s clips, speaker ID)")
+    speaker_talks, speaker_to_idx = _build_tedlium_speaker_index(root)
+    train_talks, val_talks = _split_tedlium_by_talk(speaker_talks)
+
+    train_dataset = TedliumScalingRaw(
+        train_talks, speaker_to_idx, target_seconds=target_seconds, augment=True,
+    )
+    test_dataset = TedliumScalingRaw(
+        val_talks, speaker_to_idx, target_seconds=target_seconds, augment=False,
+    )
+
+    val_speakers = len(set(s for s, _, _ in test_dataset.samples))
+    print(f"  Val covers {val_speakers}/{len(speaker_to_idx)} speakers")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True,
+    )
+
+    return train_loader, test_loader, len(speaker_to_idx)
+
+
 def get_librispeech_dataloaders(root, test_fold=1, batch_size=32, mode="raw"):  # noqa: ARG001
     DatasetClass = LibriSpeechRaw if mode == "raw" else LibriSpeechSpectrogram
 
