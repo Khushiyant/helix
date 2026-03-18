@@ -878,24 +878,36 @@ def _download_voxpopuli_hf(root):
 
 
 def _build_voxpopuli_speaker_index(root):
-    """Build per-speaker segment index from VoxPopuli, auto-downloading if needed."""
+    """Build per-speaker segment index from VoxPopuli, auto-downloading if needed.
+
+    Merges all splits and re-splits by utterance per speaker so every speaker
+    appears in both train and val (closed-set speaker ID).
+    """
     _download_voxpopuli_hf(root)
 
-    train_segs = {}
-    val_segs = {}
-    all_speakers = set()
-
-    for split_name, segs_dict in [("train", train_segs), ("validation", val_segs)]:
+    # Merge all utterances across splits
+    all_segs = {}
+    for split_name in ("train", "validation"):
         index_path = os.path.join(root, f"index_{split_name}.csv")
         meta = pd.read_csv(index_path)
         for _, row in meta.iterrows():
             speaker_id = str(row["speaker_id"])
-            segs_dict.setdefault(speaker_id, []).append(
+            all_segs.setdefault(speaker_id, []).append(
                 (row["path"], row["duration"])
             )
-            all_speakers.add(speaker_id)
 
-    speaker_to_idx = {s: i for i, s in enumerate(sorted(all_speakers))}
+    # Split by utterance per speaker: 80% train, 20% val
+    rng = np.random.RandomState(42)
+    train_segs = {}
+    val_segs = {}
+    for speaker_id in sorted(all_segs.keys()):
+        utts = list(all_segs[speaker_id])
+        rng.shuffle(utts)
+        n_val = max(1, int(len(utts) * 0.2))
+        val_segs[speaker_id] = utts[:n_val]
+        train_segs[speaker_id] = utts[n_val:]
+
+    speaker_to_idx = {s: i for i, s in enumerate(sorted(all_segs.keys()))}
     return train_segs, val_segs, speaker_to_idx
 
 
