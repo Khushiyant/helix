@@ -902,6 +902,9 @@ def _build_voxpopuli_speaker_index(root):
     val_segs = {}
     for speaker_id in sorted(all_segs.keys()):
         utts = list(all_segs[speaker_id])
+        if len(utts) <= 1:
+            train_segs[speaker_id] = utts
+            continue
         rng.shuffle(utts)
         n_val = max(1, int(len(utts) * 0.2))
         val_segs[speaker_id] = utts[:n_val]
@@ -947,7 +950,7 @@ class VoxPopuliScalingRaw(Dataset):
             data, sr = sf.read(path, dtype="float32", always_2d=True)
         except Exception as e:
             print(f"  WARNING: failed to read {path} ({type(e).__name__}): {e}")
-            return torch.zeros(1, self.target_sr)
+            return torch.zeros(1, self.target_length)
         waveform = torch.from_numpy(data.T)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
